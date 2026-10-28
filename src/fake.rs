@@ -69,6 +69,9 @@ pub struct FakeState {
     pub released: HashSet<String>,
     /// License keys that activate.
     pub license_keys: HashSet<String>,
+    /// The account each key belongs to; unlisted keys are the personal
+    /// account's.
+    pub key_accounts: HashMap<String, String>,
     /// Activated devices: id → public key.
     pub devices: HashMap<String, String>,
     /// `(email, password)` that sign in for the seat claim.
@@ -134,6 +137,7 @@ impl Default for FakeState {
             seats: Vec::new(),
             released: HashSet::new(),
             license_keys: HashSet::new(),
+            key_accounts: HashMap::new(),
             devices: HashMap::new(),
             credentials: None,
             totp: None,
@@ -426,17 +430,51 @@ fn signed(pubkey: &str, method: &str, path: &str, device_id: &str, ts: i64, sig:
         .is_ok()
 }
 
-fn seat_for(st: &mut FakeState, device: &Value) -> Result<(), HttpResponse> {
+/// The account a sign-in claim lands on: the user's team, else their own.
+fn claim_account(st: &FakeState) -> String {
+    st.team.clone().unwrap_or_else(|| PERSONAL.into())
+}
+
+/// Gives the device a seat on `account`. A device holding a seat on another
+/// account moves here (that seat is freed and its push tokens dropped),
+/// unless the request is signed with a different key than the device
+/// registered: then `409 device_id_in_use`.
+fn seat_for(st: &mut FakeState, device: &Value, account: &str) -> Result<(), HttpResponse> {
     let id = s(device, "id");
-    if st.seats.iter().any(|x| x["device_id"] == id) {
-        return Ok(());
+    let pubkey = s(device, "pubkey");
+    let held = st.seats.iter().position(|x| x["device_id"] == id);
+    if let Some(i) = held {
+        if st.seats[i]["account_id"] == account {
+            return Ok(());
+        }
+        let registered = st.devices.get(&id).cloned().unwrap_or_default();
+        if !pubkey.is_empty() && pubkey != registered {
+            return Err(reply(
+                409,
+                json!({
+                    "error": "device_id_in_use",
+                    "message": "This device is licensed on another account. Release it there first.",
+                }),
+            ));
+        }
     }
     if st.free_seats <= 0 {
         return Err(err(409, "no_seats_available"));
     }
+    if let Some(i) = held {
+        st.seats.remove(i);
+        st.free_seats += 1;
+        st.push_tokens.retain(|(d, _, _)| *d != id);
+    }
     st.free_seats -= 1;
     let seat_id = (st.seats.len() + st.released.len() + 1) as i64;
-    let team = st.team.clone();
+    let (account_name, account_type) = if account == PERSONAL {
+        ("Pat".to_string(), "person")
+    } else if st.team.as_deref() == Some(account) {
+        ("Crew".to_string(), "org")
+    } else {
+        (account.to_string(), "org")
+    };
     let time = st.time();
     st.seats.push(json!({
         "seat_id": seat_id,
@@ -445,12 +483,14 @@ fn seat_for(st: &mut FakeState, device: &Value) -> Result<(), HttpResponse> {
         "model": device.get("model"),
         "activated_at": time,
         "last_seen_at": time,
-        "account_id": team.clone().unwrap_or_else(|| PERSONAL.into()),
-        "account_name": if team.is_some() { "Crew" } else { "Pat" },
-        "account_type": if team.is_some() { "org" } else { "person" },
+        "account_id": account,
+        "account_name": account_name,
+        "account_type": account_type,
         "can_release": st.can_release,
     }));
-    st.devices.insert(id.clone(), s(device, "pubkey"));
+    if !pubkey.is_empty() {
+        st.devices.entry(id.clone()).or_insert(pubkey);
+    }
     st.released.remove(&id);
     Ok(())
 }
@@ -493,7 +533,12 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             }
             let d = body["device"].clone();
             st.free_seats += 1; // a key always has room
-            if let Err(e) = seat_for(st, &d) {
+            let account = st
+                .key_accounts
+                .get(&s(&body, "license_key"))
+                .cloned()
+                .unwrap_or_else(|| PERSONAL.into());
+            if let Err(e) = seat_for(st, &d, &account) {
                 return e;
             }
             entitlement(st, &s(&d, "id"))
@@ -507,7 +552,7 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             }
             let d = body["device"].clone();
             st.free_seats += 1;
-            if let Err(e) = seat_for(st, &d) {
+            if let Err(e) = seat_for(st, &d, PERSONAL) {
                 return e;
             }
             entitlement(st, &s(&d, "id"))
@@ -589,7 +634,8 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
                 return err(401, "session_expired");
             }
             let pubkey = st.devices.get(&id).cloned().unwrap_or_default();
-            if let Err(e) = seat_for(st, &json!({"id": id, "pubkey": pubkey})) {
+            let account = claim_account(st);
+            if let Err(e) = seat_for(st, &json!({"id": id, "pubkey": pubkey}), &account) {
                 return e;
             }
             entitlement(st, &id)
@@ -638,7 +684,8 @@ fn account_api(
             if let Some((status, code)) = st.claim_refusal.clone() {
                 return err(status, &code);
             }
-            if let Err(e) = seat_for(st, &d) {
+            let account = claim_account(st);
+            if let Err(e) = seat_for(st, &d, &account) {
                 return e;
             }
             entitlement(st, &id)

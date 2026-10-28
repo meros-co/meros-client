@@ -153,6 +153,14 @@ pub mod testing {
             }
         }
 
+        /// A device with id `id` but a key made from `key`, as a second
+        /// install claiming the same id would have.
+        pub fn with_key(id: &str, key: &str) -> TestDevice {
+            let mut d = TestDevice::new(key);
+            d.id = id.to_string();
+            d
+        }
+
         pub fn token(&self) -> Option<String> {
             self.token.lock().unwrap().clone()
         }

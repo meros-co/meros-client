@@ -118,7 +118,9 @@ impl LicenseClient {
 
     /// Called once the device is known to the service (activation, claim,
     /// App Store redeem, offline import), such as to register a push token
-    /// the service refused while the device was unknown.
+    /// the service refused while the device was unknown. A device that moved
+    /// to another account loses its push tokens there, so register again
+    /// every time.
     pub fn on_activated(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         self.on_activated = Some(Arc::new(hook));
         self
@@ -240,7 +242,9 @@ impl LicenseClient {
     }
 
     /// Activates this device with a license key, then verifies and stores
-    /// the entitlement.
+    /// the entitlement. A key of another account moves the device there; a
+    /// device whose seat elsewhere was taken with a different key gets
+    /// `device_id_in_use` (show its message).
     pub async fn activate(
         &self,
         license_key: &str,
@@ -441,7 +445,9 @@ impl LicenseClient {
         if r.status != 200 {
             return Err(self.refused(&r));
         }
-        self.apply_token(&r)
+        self.apply_token(&r)?;
+        self.activated();
+        Ok(())
     }
 
     // With the app's own Sign in with Meros token.

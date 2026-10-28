@@ -345,3 +345,75 @@ async fn a_device_without_identity_fails_before_any_request() {
     );
     assert!(fake.state().requests.is_empty());
 }
+
+#[tokio::test]
+async fn a_device_moves_between_accounts_and_must_register_push_again() {
+    let fake = FakeMeros::new();
+    {
+        let mut st = fake.state();
+        st.license_keys.insert("KEY-PERSONAL".into());
+        st.license_keys.insert("KEY-OTHER".into());
+        st.key_accounts
+            .insert("KEY-OTHER".into(), "acct-other".into());
+    }
+    let d = device("dev-move");
+    let activated = Arc::new(AtomicUsize::new(0));
+    let a = activated.clone();
+    let client = license(&fake, &d).on_activated(move || {
+        a.fetch_add(1, Ordering::SeqCst);
+    });
+    client.activate("KEY-PERSONAL", None).await.unwrap();
+    let support = meros_client::SupportApi::new(BASE, "1", fake.clone(), d.clone());
+    support
+        .register_push_token("fcm-1", "android")
+        .await
+        .unwrap();
+
+    // Another account's key moves it: no release first.
+    client.activate("KEY-OTHER", None).await.unwrap();
+    let seats = fake.state().seats.clone();
+    assert_eq!(seats.len(), 1);
+    assert_eq!(seats[0]["account_id"], "acct-other");
+    assert!(
+        fake.state().push_tokens.is_empty(),
+        "a move drops push tokens"
+    );
+    assert_eq!(
+        activated.load(Ordering::SeqCst),
+        2,
+        "the app re-registers each time"
+    );
+    assert!(client.renew(Map::new()).await);
+
+    // The same device id signed with a different key is refused.
+    let impostor = Arc::new(TestDevice::with_key("dev-move", "another key"));
+    let e = license(&fake, &impostor)
+        .activate("KEY-PERSONAL", None)
+        .await
+        .unwrap_err();
+    assert_eq!((e.status, e.code.as_str()), (Some(409), "device_id_in_use"));
+    assert!(e.message.contains("Release it there first"));
+    assert_eq!(fake.state().seats[0]["account_id"], "acct-other");
+}
+
+#[tokio::test]
+async fn a_sign_in_claim_moves_the_device_too() {
+    let fake = FakeMeros::new();
+    {
+        let mut st = fake.state();
+        st.license_keys.insert("KEY-OTHER".into());
+        st.key_accounts
+            .insert("KEY-OTHER".into(), "acct-other".into());
+        st.free_seats = 1;
+    }
+    let a = signed_in(&fake).await;
+    let d = device("dev-claim-move");
+    let client = license(&fake, &d);
+    client.activate("KEY-OTHER", None).await.unwrap();
+    // The app's sign-in claims it onto the personal account: a move.
+    client.claim_with_account(a.as_ref(), None).await.unwrap();
+    let st = fake.state();
+    assert_eq!(st.seats.len(), 1);
+    assert_eq!(st.seats[0]["account_id"], meros_client::fake::PERSONAL);
+    assert_eq!(st.free_seats, 1, "the other account's seat was freed");
+}
