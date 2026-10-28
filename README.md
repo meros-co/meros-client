@@ -34,6 +34,11 @@ Flutter apps call it from their Rust core through flutter_rust_bridge.
   `Error::head_version` holds the head version on a conflict, and
   `Error::retry_after` holds the wait on a 429. A bare 401 on a seat request
   becomes `unauthenticated`.
+- **Renewal refusals differ.** `410 seat_revoked` means the seat or its key
+  was revoked (by an admin or a refund). The client drops the token, and the
+  device may activate or claim again. `403 license_key_disabled` means a
+  suspended key, which is reversible. The device keeps its token until it
+  expires, resumes when the key is reactivated, and shows the message.
 - **Every request goes through a `Transport`.** The default is
   `ReqwestTransport` (rustls). An app may supply its own.
 

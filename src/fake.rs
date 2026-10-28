@@ -74,9 +74,12 @@ pub struct FakeState {
     /// The account each key belongs to; unlisted keys are the personal
     /// account's.
     pub key_accounts: HashMap<String, String>,
-    /// Revoked or refunded keys: refused everywhere with
-    /// `403 license_key_disabled`.
-    pub disabled_keys: HashSet<String>,
+    /// Suspended keys (reversible): activation and renewal are refused with
+    /// `403 license_key_disabled`, and a device keeps its token.
+    pub suspended_keys: HashSet<String>,
+    /// Revoked or refunded keys: activation is refused with
+    /// `403 license_key_disabled`; renewal answers `410 seat_revoked`.
+    pub revoked_keys: HashSet<String>,
     /// The key each device activated with.
     pub device_keys: HashMap<String, String>,
     /// Activated devices: id → public key.
@@ -145,7 +148,8 @@ impl Default for FakeState {
             released: HashSet::new(),
             license_keys: HashSet::new(),
             key_accounts: HashMap::new(),
-            disabled_keys: HashSet::new(),
+            suspended_keys: HashSet::new(),
+            revoked_keys: HashSet::new(),
             device_keys: HashMap::new(),
             devices: HashMap::new(),
             credentials: None,
@@ -538,7 +542,7 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             if !st.license_keys.contains(&key) {
                 return err(404, "unknown_license_key");
             }
-            if st.disabled_keys.contains(&key) {
+            if st.suspended_keys.contains(&key) || st.revoked_keys.contains(&key) {
                 return err(403, "license_key_disabled");
             }
             if !self_signed("/v1/device/activate") {
@@ -587,11 +591,12 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             if st.released.remove(&id) || !st.seats.iter().any(|x| x["device_id"] == id) {
                 return err(410, "seat_revoked");
             }
-            if st
-                .device_keys
-                .get(&id)
-                .is_some_and(|k| st.disabled_keys.contains(k))
-            {
+            let key = st.device_keys.get(&id).cloned().unwrap_or_default();
+            if st.revoked_keys.contains(&key) {
+                st.seats.retain(|x| x["device_id"] != id);
+                return err(410, "seat_revoked");
+            }
+            if st.suspended_keys.contains(&key) {
                 return err(403, "license_key_disabled");
             }
             entitlement(st, &id)

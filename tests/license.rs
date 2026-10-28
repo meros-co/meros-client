@@ -419,7 +419,7 @@ async fn a_sign_in_claim_moves_the_device_too() {
 }
 
 #[tokio::test]
-async fn a_revoke_is_a_one_time_release_and_a_disabled_key_is_refused() {
+async fn a_revoke_is_a_one_time_release_a_suspension_keeps_the_token() {
     let fake = FakeMeros::new();
     fake.state().license_keys.insert("KEY-R".into());
     fake.state().free_seats = 1;
@@ -439,9 +439,20 @@ async fn a_revoke_is_a_one_time_release_and_a_disabled_key_is_refused() {
     assert!(d.token().is_some());
     assert!(client.renew(Map::new()).await);
 
-    // A revoked or refunded key is refused everywhere.
-    fake.state().disabled_keys.insert("KEY-R".into());
+    // A suspended key is refused, but the device keeps its token.
+    fake.state().suspended_keys.insert("KEY-R".into());
     assert!(!client.renew(Map::new()).await);
+    assert!(d.token().is_some(), "a suspension is reversible");
     let e = client.activate("KEY-R", None).await.unwrap_err();
     assert!(e.license_key_disabled() && e.status == Some(403));
+    // Reactivated: renewal works again.
+    fake.state().suspended_keys.clear();
+    assert!(client.renew(Map::new()).await);
+
+    // A revoked or refunded key ends it: 410 at renewal drops the token.
+    fake.state().revoked_keys.insert("KEY-R".into());
+    assert!(!client.renew(Map::new()).await);
+    assert_eq!(d.token(), None);
+    let e = client.activate("KEY-R", None).await.unwrap_err();
+    assert!(e.license_key_disabled());
 }

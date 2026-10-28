@@ -243,8 +243,8 @@ impl LicenseClient {
 
     /// Activates this device with a license key, then verifies and stores
     /// the entitlement. A revoked seat doesn't stop it: the device may
-    /// activate again with any key, the same one included. A revoked or
-    /// refunded key is refused with `license_key_disabled`. A key of another
+    /// activate again with any key, the same one included. A suspended,
+    /// revoked or refunded key is refused with `license_key_disabled`. A key of another
     /// account moves the device there; a
     /// device whose seat elsewhere was taken with a different key gets
     /// `device_id_in_use` (show its message).
@@ -345,7 +345,8 @@ impl LicenseClient {
 
     /// Renews the entitlement. Quiet on failure, since grace covers outages;
     /// true when a new token was applied. `device_info` adds fields after
-    /// `app_version` (optional compliance signals). A `seat_revoked` (an
+    /// `app_version` (optional compliance signals). A suspended key
+    /// (`403 license_key_disabled`) keeps the token. A `seat_revoked` (an
     /// admin released the seat) or `unknown_device` drops the entitlement.
     pub async fn renew(&self, device_info: Map<String, Value>) -> bool {
         let path = "/v1/device/renew";
