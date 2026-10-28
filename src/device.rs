@@ -42,6 +42,79 @@ pub trait LicenseDevice: DeviceSigner {
     }
 }
 
+/// A [`LicenseDevice`] over a meros-entitlement [`Store`]: the Store's own
+/// device id, seed and token file, so a device already activated through it
+/// keeps its id, key and seat.
+///
+/// [`Store`]: meros_entitlement::Store
+#[cfg(feature = "entitlement")]
+pub struct EntitlementDevice<F: 'static> {
+    store: &'static meros_entitlement::Store<F>,
+    model: String,
+    name: Option<String>,
+}
+
+#[cfg(feature = "entitlement")]
+impl<F> EntitlementDevice<F>
+where
+    F: serde::de::DeserializeOwned + Clone + 'static,
+{
+    /// `model` and `name` come from the platform.
+    pub fn new(
+        store: &'static meros_entitlement::Store<F>,
+        model: impl Into<String>,
+        name: Option<String>,
+    ) -> Self {
+        EntitlementDevice {
+            store,
+            model: model.into(),
+            name,
+        }
+    }
+}
+
+#[cfg(feature = "entitlement")]
+impl<F> DeviceSigner for EntitlementDevice<F>
+where
+    F: serde::de::DeserializeOwned + Clone + 'static,
+{
+    fn identity(&self) -> Option<DeviceIdentity> {
+        let (id, _) = self.store.device_identity()?;
+        Some(DeviceIdentity {
+            id,
+            pubkey: self.store.device_pubkey()?,
+        })
+    }
+
+    fn sign(&self, method: &str, path: &str, ts: i64) -> Option<String> {
+        self.store
+            .sign_request(method, path, ts)
+            .map(|(_, sig)| sig)
+    }
+}
+
+#[cfg(feature = "entitlement")]
+impl<F> LicenseDevice for EntitlementDevice<F>
+where
+    F: serde::de::DeserializeOwned + Clone + 'static,
+{
+    fn apply_token(&self, token: &str) -> Result<(), String> {
+        self.store.apply_token(token)
+    }
+
+    fn clear_token(&self) {
+        self.store.clear_token();
+    }
+
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+
+    fn name(&self) -> Option<String> {
+        self.name.clone()
+    }
+}
+
 /// A device for tests: a fixed Ed25519 key, tokens kept in memory.
 #[cfg(any(test, feature = "fake"))]
 pub mod testing {
@@ -119,5 +192,55 @@ pub mod testing {
         fn name(&self) -> Option<String> {
             self.name.clone()
         }
+    }
+}
+
+#[cfg(all(test, feature = "entitlement"))]
+mod entitlement_tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    #[derive(Clone, serde::Deserialize)]
+    struct Features {}
+
+    static STORE: meros_entitlement::Store<Features> =
+        meros_entitlement::Store::new(&[], || Features {});
+
+    #[test]
+    fn an_entitlement_store_keeps_its_device_id_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        STORE.init(dir.path().to_str().unwrap());
+        let device = EntitlementDevice::new(&STORE, "Model-1", Some("Desk".into()));
+        let id = device.identity().unwrap();
+        // The id and key the Store made are the ones the client signs with.
+        assert_eq!(id.id, STORE.device_identity().unwrap().0);
+        let again = EntitlementDevice::new(&STORE, "Model-1", None)
+            .identity()
+            .unwrap();
+        assert_eq!(again, id);
+        let sig = device
+            .sign("POST", "/v1/device/renew", 1_790_000_000)
+            .unwrap();
+        let key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&id.pubkey)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig).unwrap()).unwrap();
+        VerifyingKey::from_bytes(&key)
+            .unwrap()
+            .verify(
+                format!("POST|/v1/device/renew|{}|1790000000", id.id).as_bytes(),
+                &sig,
+            )
+            .unwrap();
+        assert_eq!(
+            (device.model(), device.name()),
+            ("Model-1".to_string(), Some("Desk".to_string()))
+        );
+        // A token that doesn't verify is refused with the Store's reason.
+        assert!(device.apply_token("not-a-token").is_err());
     }
 }

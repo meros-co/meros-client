@@ -47,6 +47,8 @@ pub use cloud::{
     MerosAccount, MerosCloud, MerosDoc, MerosDocInfo, MerosDocVersion, MerosFile, MerosProfile,
     file_hash,
 };
+#[cfg(feature = "entitlement")]
+pub use device::EntitlementDevice;
 #[cfg(any(test, feature = "fake"))]
 pub use device::testing;
 pub use device::{DeviceIdentity, DeviceSigner, LicenseDevice};
