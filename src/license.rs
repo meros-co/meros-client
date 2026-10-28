@@ -242,7 +242,10 @@ impl LicenseClient {
     }
 
     /// Activates this device with a license key, then verifies and stores
-    /// the entitlement. A key of another account moves the device there; a
+    /// the entitlement. A revoked seat doesn't stop it: the device may
+    /// activate again with any key, the same one included. A revoked or
+    /// refunded key is refused with `license_key_disabled`. A key of another
+    /// account moves the device there; a
     /// device whose seat elsewhere was taken with a different key gets
     /// `device_id_in_use` (show its message).
     pub async fn activate(

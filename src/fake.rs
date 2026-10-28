@@ -65,13 +65,20 @@ pub struct FakeState {
     pub can_release: bool,
     /// Devices holding licenses, as `GET …/v1/account/seats` lists them.
     pub seats: Vec<Value>,
-    /// Device ids whose seats were released; they get `seat_revoked` next.
+    /// Device ids whose seats were released or revoked; they get
+    /// `410 seat_revoked` at their next renewal, once. Activating or
+    /// claiming again is allowed.
     pub released: HashSet<String>,
     /// License keys that activate.
     pub license_keys: HashSet<String>,
     /// The account each key belongs to; unlisted keys are the personal
     /// account's.
     pub key_accounts: HashMap<String, String>,
+    /// Revoked or refunded keys: refused everywhere with
+    /// `403 license_key_disabled`.
+    pub disabled_keys: HashSet<String>,
+    /// The key each device activated with.
+    pub device_keys: HashMap<String, String>,
     /// Activated devices: id → public key.
     pub devices: HashMap<String, String>,
     /// `(email, password)` that sign in for the seat claim.
@@ -138,6 +145,8 @@ impl Default for FakeState {
             released: HashSet::new(),
             license_keys: HashSet::new(),
             key_accounts: HashMap::new(),
+            disabled_keys: HashSet::new(),
+            device_keys: HashMap::new(),
             devices: HashMap::new(),
             credentials: None,
             totp: None,
@@ -525,8 +534,12 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
 
     match (r.method.as_str(), rest) {
         ("POST", ["device", "activate"]) | ("POST", ["offline", "activate"]) => {
-            if !st.license_keys.contains(&s(&body, "license_key")) {
+            let key = s(&body, "license_key");
+            if !st.license_keys.contains(&key) {
                 return err(404, "unknown_license_key");
+            }
+            if st.disabled_keys.contains(&key) {
+                return err(403, "license_key_disabled");
             }
             if !self_signed("/v1/device/activate") {
                 return err(401, "bad_signature");
@@ -541,6 +554,7 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             if let Err(e) = seat_for(st, &d, &account) {
                 return e;
             }
+            st.device_keys.insert(s(&d, "id"), key);
             entitlement(st, &s(&d, "id"))
         }
         ("POST", ["apple", "redeem"]) => {
@@ -570,8 +584,15 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
                 st.devices.remove(&id);
                 return reply(200, json!({"released": true}));
             }
-            if st.released.contains(&id) || !st.seats.iter().any(|x| x["device_id"] == id) {
+            if st.released.remove(&id) || !st.seats.iter().any(|x| x["device_id"] == id) {
                 return err(410, "seat_revoked");
+            }
+            if st
+                .device_keys
+                .get(&id)
+                .is_some_and(|k| st.disabled_keys.contains(k))
+            {
+                return err(403, "license_key_disabled");
             }
             entitlement(st, &id)
         }

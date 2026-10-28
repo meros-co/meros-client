@@ -76,8 +76,14 @@ impl Error {
     pub fn no_seats(&self) -> bool {
         self.code == "no_seats_available"
     }
+    /// The seat was revoked: renewal answers it once and the token is
+    /// dropped. The device may activate or claim again afterwards.
     pub fn seat_revoked(&self) -> bool {
         self.code == "seat_revoked"
+    }
+    /// The key was revoked or refunded: refused everywhere.
+    pub fn license_key_disabled(&self) -> bool {
+        self.code == "license_key_disabled"
     }
     pub fn unauthenticated(&self) -> bool {
         self.code == "unauthenticated"

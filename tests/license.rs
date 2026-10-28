@@ -417,3 +417,31 @@ async fn a_sign_in_claim_moves_the_device_too() {
     assert_eq!(st.seats[0]["account_id"], meros_client::fake::PERSONAL);
     assert_eq!(st.free_seats, 1, "the other account's seat was freed");
 }
+
+#[tokio::test]
+async fn a_revoke_is_a_one_time_release_and_a_disabled_key_is_refused() {
+    let fake = FakeMeros::new();
+    fake.state().license_keys.insert("KEY-R".into());
+    fake.state().free_seats = 1;
+    let a = signed_in(&fake).await;
+    let d = device("dev-revoked");
+    let client = license(&fake, &d);
+    client.activate("KEY-R", None).await.unwrap();
+
+    // An admin revokes the seat: the next renewal drops the token, once.
+    let seat = client.seats(a.as_ref()).await.unwrap()[0].seat_id;
+    client.release_seat(a.as_ref(), seat).await.unwrap();
+    assert!(!client.renew(Map::new()).await);
+    assert_eq!(d.token(), None);
+
+    // The device may activate again, with the same key.
+    client.activate("KEY-R", None).await.unwrap();
+    assert!(d.token().is_some());
+    assert!(client.renew(Map::new()).await);
+
+    // A revoked or refunded key is refused everywhere.
+    fake.state().disabled_keys.insert("KEY-R".into());
+    assert!(!client.renew(Map::new()).await);
+    let e = client.activate("KEY-R", None).await.unwrap_err();
+    assert!(e.license_key_disabled() && e.status == Some(403));
+}
