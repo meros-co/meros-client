@@ -30,6 +30,13 @@ pub trait LicenseDevice: DeviceSigner {
     /// Drops the stored entitlement.
     fn clear_token(&self);
 
+    /// Whether the device holds an entitlement now (valid or in grace).
+    /// [`LicenseClient::adopt_after_sign_in`](crate::LicenseClient::adopt_after_sign_in)
+    /// claims only for a licensed device; the default says it doesn't.
+    fn has_entitlement(&self) -> bool {
+        false
+    }
+
     /// A short model string from the platform ("SM-X518U", "iPad13,1").
     fn model(&self) -> String {
         "Device".into()
@@ -104,6 +111,16 @@ where
 
     fn clear_token(&self) {
         self.store.clear_token();
+    }
+
+    fn has_entitlement(&self) -> bool {
+        matches!(
+            self.store.current(),
+            Some((
+                meros_entitlement::Validity::Valid | meros_entitlement::Validity::Grace,
+                _
+            ))
+        )
     }
 
     fn model(&self) -> String {
@@ -191,6 +208,10 @@ pub mod testing {
 
         fn clear_token(&self) {
             *self.token.lock().unwrap() = None;
+        }
+
+        fn has_entitlement(&self) -> bool {
+            self.token.lock().unwrap().is_some()
         }
 
         fn model(&self) -> String {

@@ -81,6 +81,22 @@ fn or_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> 
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
+/// What [`LicenseClient::adopt_after_sign_in`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInClaim {
+    /// The service answered with a token for this device's seat, now
+    /// applied: an unowned license (a guest or App Store purchase) adopted by
+    /// the account, or an owned one refreshed.
+    Claimed,
+    /// The license belongs to an account the user can't claim a seat on
+    /// (`no_seats_available`): the current license is kept, and nothing
+    /// needs showing.
+    KeptCurrent,
+    /// The device holds no license, so nothing was sent. Claiming one is
+    /// the user's choice ([`LicenseClient::claim_with_account`]).
+    NotLicensed,
+}
+
 type Hook = Arc<dyn Fn() + Send + Sync>;
 
 /// The licensing client.
@@ -520,6 +536,28 @@ impl LicenseClient {
         self.apply_token(&r)?;
         self.activated();
         Ok(())
+    }
+
+    /// The step after Sign in with Meros on a licensed device: the account
+    /// claim, which adopts an unowned license (a guest or App Store
+    /// purchase) into the signed-in account and otherwise refreshes the
+    /// token. Call it after every sign-in. A license owned elsewhere that
+    /// the account has no seat for is kept quietly
+    /// ([`SignInClaim::KeptCurrent`]). Other refusals, such as
+    /// `device_id_in_use` and the sign-in errors, are returned to show.
+    pub async fn adopt_after_sign_in(
+        &self,
+        token: &dyn AccessTokenSource,
+        device_name: Option<&str>,
+    ) -> Result<SignInClaim, Error> {
+        if !self.device.has_entitlement() {
+            return Ok(SignInClaim::NotLicensed);
+        }
+        match self.claim_with_account(token, device_name).await {
+            Ok(()) => Ok(SignInClaim::Claimed),
+            Err(e) if e.no_seats() => Ok(SignInClaim::KeptCurrent),
+            Err(e) => Err(e),
+        }
     }
 
     /// The devices holding the product's licenses on the user's team and

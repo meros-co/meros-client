@@ -61,7 +61,9 @@ pub use events::{
 #[cfg(feature = "reqwest")]
 pub use http::ReqwestTransport;
 pub use http::{BoxFuture, HttpRequest, HttpResponse, Transport};
-pub use license::{AuthResult, LicenseClient, LicenseConfig, LicenseLink, LicenseSeat};
+pub use license::{
+    AuthResult, LicenseClient, LicenseConfig, LicenseLink, LicenseSeat, SignInClaim,
+};
 pub use support::{
     AccountSupportApi, MemoryTicketSeenStore, ReplyTracker, SupportApi, SupportInbox,
     SupportMessage, SupportThread, SupportTicket, TicketSeenStore, TicketStatus,

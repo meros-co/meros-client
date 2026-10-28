@@ -77,6 +77,10 @@ pub struct FakeState {
     /// Suspended keys (reversible): activation and renewal are refused with
     /// `403 license_key_disabled`, and a device keeps its token.
     pub suspended_keys: HashSet<String>,
+    /// Keys no account owns yet (a guest purchase). A device activated with
+    /// one, or through the App Store, holds an unowned seat that the next
+    /// account claim adopts into the signed-in account.
+    pub unowned_keys: HashSet<String>,
     /// Revoked or refunded keys: activation is refused with
     /// `403 license_key_disabled`; renewal answers `410 seat_revoked`.
     pub revoked_keys: HashSet<String>,
@@ -150,6 +154,7 @@ impl Default for FakeState {
             key_accounts: HashMap::new(),
             suspended_keys: HashSet::new(),
             revoked_keys: HashSet::new(),
+            unowned_keys: HashSet::new(),
             device_keys: HashMap::new(),
             devices: HashMap::new(),
             credentials: None,
@@ -443,6 +448,22 @@ fn signed(pubkey: &str, method: &str, path: &str, device_id: &str, ts: i64, sig:
         .is_ok()
 }
 
+/// The account id of a seat no account owns yet.
+pub const UNOWNED: &str = "";
+
+/// An account's display name and type, as the seats list shows them.
+fn account_label(st: &FakeState, account: &str) -> (String, &'static str) {
+    if account == UNOWNED {
+        (String::new(), "")
+    } else if account == PERSONAL {
+        ("Pat".into(), "person")
+    } else if st.team.as_deref() == Some(account) {
+        ("Crew".into(), "org")
+    } else {
+        (account.to_string(), "org")
+    }
+}
+
 /// The account a sign-in claim lands on: the user's team, else their own.
 fn claim_account(st: &FakeState) -> String {
     st.team.clone().unwrap_or_else(|| PERSONAL.into())
@@ -458,6 +479,16 @@ fn seat_for(st: &mut FakeState, device: &Value, account: &str) -> Result<(), Htt
     let held = st.seats.iter().position(|x| x["device_id"] == id);
     if let Some(i) = held {
         if st.seats[i]["account_id"] == account {
+            return Ok(());
+        }
+        // An unowned seat is adopted by the account claiming it: same seat,
+        // no new one taken.
+        if st.seats[i]["account_id"] == UNOWNED && account != UNOWNED {
+            let (name, kind) = account_label(st, account);
+            let seat = &mut st.seats[i];
+            seat["account_id"] = json!(account);
+            seat["account_name"] = json!(name);
+            seat["account_type"] = json!(kind);
             return Ok(());
         }
         let registered = st.devices.get(&id).cloned().unwrap_or_default();
@@ -481,13 +512,7 @@ fn seat_for(st: &mut FakeState, device: &Value, account: &str) -> Result<(), Htt
     }
     st.free_seats -= 1;
     let seat_id = (st.seats.len() + st.released.len() + 1) as i64;
-    let (account_name, account_type) = if account == PERSONAL {
-        ("Pat".to_string(), "person")
-    } else if st.team.as_deref() == Some(account) {
-        ("Crew".to_string(), "org")
-    } else {
-        (account.to_string(), "org")
-    };
+    let (account_name, account_type) = account_label(st, account);
     let time = st.time();
     st.seats.push(json!({
         "seat_id": seat_id,
@@ -550,11 +575,14 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             }
             let d = body["device"].clone();
             st.free_seats += 1; // a key always has room
-            let account = st
-                .key_accounts
-                .get(&s(&body, "license_key"))
-                .cloned()
-                .unwrap_or_else(|| PERSONAL.into());
+            let account = if st.unowned_keys.contains(&key) {
+                UNOWNED.to_string()
+            } else {
+                st.key_accounts
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| PERSONAL.into())
+            };
             if let Err(e) = seat_for(st, &d, &account) {
                 return e;
             }
@@ -570,7 +598,9 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             }
             let d = body["device"].clone();
             st.free_seats += 1;
-            if let Err(e) = seat_for(st, &d, PERSONAL) {
+            // An App Store purchase belongs to no account until a sign-in
+            // claim adopts it.
+            if let Err(e) = seat_for(st, &d, UNOWNED) {
                 return e;
             }
             entitlement(st, &s(&d, "id"))

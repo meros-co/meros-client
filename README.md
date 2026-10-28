@@ -6,7 +6,7 @@ Flutter apps call it from their Rust core through flutter_rust_bridge.
 
 | Module | What it does |
 |---|---|
-| `license` | The device license API: activate with a key, renew, release, claim a seat by signing in (with TOTP), claim and list or release seats with the app's own sign-in, App Store redeem, "manage online" and browser-claim links, offline activation blobs, and `activate`/`claim` deep links |
+| `license` | The device license API: activate with a key, renew, release, claim a seat by signing in (with TOTP), claim and list or release seats with the app's own sign-in, adopt an unowned license (guest or App Store purchase) into the account after sign-in (`adopt_after_sign_in`), App Store redeem, "manage online" and browser-claim links, offline activation blobs, and `activate`/`claim` deep links |
 | `auth` | Sign in with Meros: authorization code with PKCE (S256), rotating refresh tokens kept in the app's `TokenStore`, and sign-out by revocation |
 | `loopback` | The desktop loopback redirect (RFC 8252). Feature `loopback` |
 | `cloud` | Meros Cloud: profiles, versioned documents, files (signed-URL upload and checked download), accounts and entitlements |

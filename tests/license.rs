@@ -456,3 +456,110 @@ async fn a_revoke_is_a_one_time_release_a_suspension_keeps_the_token() {
     let e = client.activate("KEY-R", None).await.unwrap_err();
     assert!(e.license_key_disabled());
 }
+
+mod adopt_after_sign_in {
+    use super::*;
+    use meros_client::SignInClaim;
+    use meros_client::fake::PERSONAL;
+
+    #[tokio::test]
+    async fn an_unowned_key_is_adopted_into_the_signed_in_account() {
+        let fake = FakeMeros::new();
+        {
+            let mut st = fake.state();
+            st.license_keys.insert("GUEST-KEY".into());
+            st.unowned_keys.insert("GUEST-KEY".into());
+        }
+        let d = device("dev-guest");
+        let client = license(&fake, &d);
+        client.activate("GUEST-KEY", None).await.unwrap();
+        let seat = fake.state().seats[0]["seat_id"].clone();
+        assert_eq!(fake.state().seats[0]["account_id"], "");
+
+        let a = signed_in(&fake).await;
+        let before = d.token();
+        let outcome = client.adopt_after_sign_in(a.as_ref(), None).await.unwrap();
+        assert_eq!(outcome, SignInClaim::Claimed);
+        let st = fake.state();
+        assert_eq!(st.seats.len(), 1);
+        assert_eq!(st.seats[0]["seat_id"], seat, "the same seat");
+        assert_eq!(st.seats[0]["account_id"], PERSONAL);
+        assert_ne!(d.token(), before, "a fresh token");
+        assert_eq!(st.free_seats, 0, "no other seat was taken");
+    }
+
+    #[tokio::test]
+    async fn an_app_store_purchase_is_adopted_too() {
+        let fake = FakeMeros::new();
+        let d = device("dev-iap");
+        let client = license(&fake, &d);
+        client.redeem_app_store("signed-jws", None).await.unwrap();
+        let a = signed_in(&fake).await;
+        assert_eq!(
+            client.adopt_after_sign_in(a.as_ref(), None).await.unwrap(),
+            SignInClaim::Claimed
+        );
+        assert_eq!(fake.state().seats[0]["account_id"], PERSONAL);
+    }
+
+    #[tokio::test]
+    async fn an_owned_license_is_refreshed_and_one_owned_elsewhere_is_kept_quietly() {
+        let fake = FakeMeros::new();
+        {
+            let mut st = fake.state();
+            st.license_keys.insert("MINE".into());
+            st.license_keys.insert("THEIRS".into());
+            st.key_accounts
+                .insert("THEIRS".into(), "acct-someone-else".into());
+        }
+        let a = signed_in(&fake).await;
+
+        // Owned by the signed-in account: just a fresh token.
+        let mine = device("dev-mine");
+        let c = license(&fake, &mine);
+        c.activate("MINE", None).await.unwrap();
+        let before = mine.token();
+        assert_eq!(
+            c.adopt_after_sign_in(a.as_ref(), None).await.unwrap(),
+            SignInClaim::Claimed
+        );
+        assert_ne!(mine.token(), before);
+
+        // Owned by another account with no seat free here: kept, no error.
+        let theirs = device("dev-theirs");
+        let c = license(&fake, &theirs);
+        c.activate("THEIRS", None).await.unwrap();
+        let kept = theirs.token();
+        assert_eq!(
+            c.adopt_after_sign_in(a.as_ref(), None).await.unwrap(),
+            SignInClaim::KeptCurrent
+        );
+        assert_eq!(theirs.token(), kept);
+        assert_eq!(
+            fake.state()
+                .seats
+                .iter()
+                .find(|s| s["device_id"] == "dev-theirs")
+                .unwrap()["account_id"],
+            "acct-someone-else"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unlicensed_device_sends_nothing() {
+        let fake = FakeMeros::new();
+        fake.state().free_seats = 1;
+        let a = signed_in(&fake).await;
+        let d = device("dev-none");
+        let before = fake.requests_to("/v1/account/claim").len();
+        assert_eq!(
+            license(&fake, &d)
+                .adopt_after_sign_in(a.as_ref(), None)
+                .await
+                .unwrap(),
+            SignInClaim::NotLicensed
+        );
+        assert_eq!(fake.requests_to("/v1/account/claim").len(), before);
+        assert_eq!(fake.state().free_seats, 1);
+    }
+}
