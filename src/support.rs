@@ -196,12 +196,20 @@ impl SupportApi {
     }
 
     /// Files a ticket. `diagnostics` (optional) goes with the first message.
+    ///
+    /// The subject must be one line and the text free of control characters
+    /// (newlines and tabs are fine in the message), else `invalid_subject`
+    /// or `invalid_message` before anything is sent. Refusals to expect:
+    /// `rate_limited` (show the message, don't retry automatically) and
+    /// `too_many_open_tickets` (point the user to an open ticket). Sending
+    /// the same ticket again returns the first one, so a retry is safe.
     pub async fn create(
         &self,
         subject: &str,
         message: &str,
         diagnostics: Option<&str>,
     ) -> Result<SupportTicket, Error> {
+        validate(subject, message)?;
         let mut body = json!({"subject": subject, "message": message});
         if let Some(d) = diagnostics.filter(|d| !d.is_empty()) {
             body["app_diagnostics"] = json!(d);
@@ -251,8 +259,16 @@ impl SupportApi {
         })
     }
 
-    /// Replies on a ticket (reopening a closed one).
+    /// Replies on a ticket (reopening a closed one). The text must be free
+    /// of control characters (`invalid_message`); an identical reply sent
+    /// again soon after is not added twice.
     pub async fn reply(&self, id: &str, message: &str) -> Result<SupportTicket, Error> {
+        if !clean(message, true) {
+            return Err(invalid(
+                "invalid_message",
+                "The message has characters that can't be sent.",
+            ));
+        }
         let path = format!("/v1/support/tickets/{}/messages", segment(id));
         Self::ticket_of(&self.post(&path, json!({"message": message})).await?)
     }
@@ -267,6 +283,33 @@ impl SupportApi {
         let body = json!({"platform": platform, "token": token, "app_version": self.app_version});
         self.post("/v1/device/push-token", body).await.map(|_| ())
     }
+}
+
+/// Text without control characters; `multiline` allows newlines and tabs.
+fn clean(text: &str, multiline: bool) -> bool {
+    text.chars()
+        .all(|c| !c.is_control() || (multiline && matches!(c, '\n' | '\r' | '\t')))
+}
+
+fn invalid(code: &str, message: &str) -> Error {
+    Error::new(Some(422), code, message)
+}
+
+/// The checks the service makes, made first so nothing doomed is sent.
+fn validate(subject: &str, message: &str) -> Result<(), Error> {
+    if subject.trim().is_empty() || !clean(subject, false) {
+        return Err(invalid(
+            "invalid_subject",
+            "The subject must be one line of text.",
+        ));
+    }
+    if !clean(message, true) {
+        return Err(invalid(
+            "invalid_message",
+            "The message has characters that can't be sent.",
+        ));
+    }
+    Ok(())
 }
 
 /// Where the user's last-seen time per ticket lives (unix seconds of the

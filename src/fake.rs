@@ -98,6 +98,10 @@ pub struct FakeState {
     pub tickets: Vec<FakeTicket>,
     /// `(device_id, platform, token)`.
     pub push_tokens: Vec<(String, String, String)>,
+    /// Refuses support requests with `429 rate_limited`.
+    pub support_rate_limited: bool,
+    /// Tickets a device may have open (not closed).
+    pub open_ticket_cap: usize,
     /// Events ingested, as received.
     pub events: Vec<Value>,
     /// The batch cap event ingest enforces.
@@ -141,6 +145,8 @@ impl Default for FakeState {
             deleted: BTreeSet::new(),
             tickets: Vec::new(),
             push_tokens: Vec::new(),
+            support_rate_limited: false,
+            open_ticket_cap: 10,
             events: Vec::new(),
             event_batch_cap: 500,
             requests: Vec::new(),
@@ -316,7 +322,16 @@ impl FakeMeros {
                 st.revoke_session();
                 HttpResponse::new(200, Vec::new())
             }
-            ["app", _product, "v1", rest @ ..] => device_api(&mut st, &r, rest),
+            // The device API, at `/app/{product}/v1/…` or a service's own
+            // root.
+            ["app", _, "v1", rest @ ..] | ["v1", rest @ ..]
+                if matches!(
+                    rest.first(),
+                    Some(&("device" | "offline" | "apple" | "account" | "support"))
+                ) =>
+            {
+                device_api(&mut st, &r, rest)
+            }
             _ => {
                 let token = r
                     .header_value("Authorization")
@@ -677,7 +692,32 @@ fn support_api(
     }
     let clock = st.clock;
     match (method, &rest[2..]) {
+        _ if st.support_rate_limited => reply(
+            429,
+            json!({"error": "rate_limited", "message": "Too many requests. Try again later."}),
+        ),
         ("POST", []) => {
+            let subject = s(body, "subject");
+            let message = s(body, "message");
+            if subject.chars().any(char::is_control) {
+                return err(422, "invalid_subject");
+            }
+            // An identical resend returns the first ticket.
+            if let Some(t) = st.tickets.iter().find(|t| {
+                t.device_id == id
+                    && t.subject == subject
+                    && t.messages.first().map(|m| &m.1) == Some(&message)
+            }) {
+                return reply(200, json!({"ticket": ticket_json(t)}));
+            }
+            let open = st
+                .tickets
+                .iter()
+                .filter(|t| t.device_id == id && t.status != "closed")
+                .count();
+            if open >= st.open_ticket_cap {
+                return err(429, "too_many_open_tickets");
+            }
             let n = st.next();
             let t = FakeTicket {
                 id: format!("tkt_{n}"),

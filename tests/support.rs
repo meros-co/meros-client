@@ -119,3 +119,63 @@ async fn the_inbox_and_tracker_follow_replies() {
     inbox.refresh(&api, false).await.unwrap();
     assert!(inbox.tickets().is_empty());
 }
+
+#[tokio::test]
+async fn the_service_safeguards_reach_the_app_and_bad_text_is_never_sent() {
+    let (fake, _, api) = setup().await;
+    // Checked here first: nothing is sent.
+    let sent = || fake.requests_to("/v1/support/tickets").len();
+    let before = sent();
+    assert_eq!(
+        api.create("Two\nlines", "m", None).await.unwrap_err().code,
+        "invalid_subject"
+    );
+    assert_eq!(
+        api.create("", "m", None).await.unwrap_err().code,
+        "invalid_subject"
+    );
+    assert_eq!(
+        api.create("S", "bell\u{7}", None).await.unwrap_err().code,
+        "invalid_message"
+    );
+    assert_eq!(sent(), before);
+    // A resend is the same ticket.
+    let a = api
+        .create("Audio drops", "Line one\nline two", None)
+        .await
+        .unwrap();
+    let again = api
+        .create("Audio drops", "Line one\nline two", None)
+        .await
+        .unwrap();
+    assert_eq!(a.id, again.id);
+    assert_eq!(fake.state().tickets.len(), 1);
+    // The open-ticket cap and the rate limit keep their codes.
+    fake.state().open_ticket_cap = 1;
+    let e = api.create("Another", "m", None).await.unwrap_err();
+    assert!(e.too_many_open_tickets() && e.status == Some(429));
+    fake.state().support_rate_limited = true;
+    let e = api.list().await.unwrap_err();
+    assert!(e.rate_limited());
+    assert_eq!(e.message, "Too many requests. Try again later.");
+}
+
+#[tokio::test]
+async fn a_service_at_its_own_root_works_too() {
+    let fake = FakeMeros::new();
+    fake.state().license_keys.insert("K".into());
+    let d = Arc::new(TestDevice::new("dev-root"));
+    let lc = meros_client::LicenseClient::new(
+        meros_client::LicenseConfig {
+            base_url: "https://service.example.test".into(),
+            app_name: "Example".into(),
+            app_version: "1".into(),
+        },
+        fake.clone(),
+        d.clone(),
+    );
+    lc.activate("K", None).await.unwrap();
+    let api = SupportApi::new("https://service.example.test", "1", fake.clone(), d);
+    api.create("S", "m", None).await.unwrap();
+    assert_eq!(api.list().await.unwrap().len(), 1);
+}

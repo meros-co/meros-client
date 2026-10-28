@@ -85,6 +85,14 @@ impl Error {
     pub fn device_not_activated(&self) -> bool {
         self.code == "unknown_device"
     }
+    /// Too many requests: show the message; don't retry automatically.
+    pub fn rate_limited(&self) -> bool {
+        self.code == "rate_limited"
+    }
+    /// The device has too many tickets open: point the user to one.
+    pub fn too_many_open_tickets(&self) -> bool {
+        self.code == "too_many_open_tickets"
+    }
     pub fn conflict(&self) -> bool {
         self.code == "version_conflict"
     }
