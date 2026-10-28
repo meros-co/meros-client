@@ -36,3 +36,23 @@ ed25519-dalek = { version = "2", optional = true }
 ed25519-dalek = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+
+[[test]]
+name = "auth"
+required-features = ["fake", "loopback"]
+
+[[test]]
+name = "license"
+required-features = ["fake"]
+
+[[test]]
+name = "cloud"
+required-features = ["fake"]
+
+[[test]]
+name = "support"
+required-features = ["fake"]
+
+[[test]]
+name = "events"
+required-features = ["fake", "events-runtime"]

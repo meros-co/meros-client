@@ -36,6 +36,9 @@ pub mod support;
 #[cfg(feature = "loopback")]
 pub mod loopback;
 
+#[cfg(feature = "fake")]
+pub mod fake;
+
 pub use auth::{
     AccessTokenSource, AuthConfig, MemoryTokenStore, MerosAuth, MerosUser, Pkce, StaticToken,
     TokenStore,
