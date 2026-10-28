@@ -1,0 +1,38 @@
+//! Clients for the Meros services, in Rust, for every Meros app whatever its
+//! language: desktop apps use them directly, and Flutter apps reach them
+//! from their Rust core through flutter_rust_bridge.
+//!
+//! - [`LicenseClient`]: the device license API (activate, renew, release,
+//!   sign-in claim with TOTP, claim and seats with the app's sign-in, App
+//!   Store redeem, manage and browser-claim links, offline activation) and
+//!   [`LicenseLink`] deep links.
+//! - [`MerosAuth`]: Sign in with Meros (authorization code with PKCE S256,
+//!   rotating refresh tokens in the app's [`TokenStore`]), with a
+//!   [`loopback`] redirect for desktop.
+//! - [`MerosCloud`]: profiles, versioned documents, files, accounts and
+//!   entitlements.
+//! - [`SupportApi`], [`SupportInbox`] and [`ReplyTracker`]: support tickets
+//!   and push-token registration.
+//! - [`Emitter`]: the Meros Event Envelope v1, logged locally and delivered
+//!   in batches.
+//! - [`fake::FakeMeros`] (feature `fake`): the services in memory, for app
+//!   tests with no network.
+//!
+//! Nothing here names a host: the app passes its issuer, base URLs and
+//! client id (see [`Environment`]). Every request goes through a
+//! [`Transport`]; errors carry the server's code unchanged in
+//! [`Error::code`].
+
+pub mod device;
+pub mod environment;
+pub mod error;
+pub mod http;
+
+#[cfg(any(test, feature = "fake"))]
+pub use device::testing;
+pub use device::{DeviceIdentity, DeviceSigner, LicenseDevice};
+pub use environment::Environment;
+pub use error::Error;
+#[cfg(feature = "reqwest")]
+pub use http::ReqwestTransport;
+pub use http::{BoxFuture, HttpRequest, HttpResponse, Transport};

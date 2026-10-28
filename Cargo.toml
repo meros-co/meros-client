@@ -1,0 +1,38 @@
+[package]
+name = "meros-client"
+version = "0.1.0"
+edition = "2024"
+description = "The Meros client services in one place: device licensing, Sign in with Meros, Meros Cloud, support tickets and the event emitter, plus an in-memory fake of the services for tests"
+license = "MIT"
+repository = "https://github.com/meros-co/meros-client"
+publish = false
+
+[lib]
+name = "meros_client"
+
+[features]
+default = ["reqwest"]
+# The HTTP transport apps use. Without it, the app supplies its own Transport.
+reqwest = ["dep:reqwest"]
+# The loopback redirect for desktop sign-in (RFC 8252).
+loopback = ["tokio/net", "tokio/io-util", "tokio/time"]
+# Periodic event delivery on the current Tokio runtime.
+events-runtime = ["tokio/rt", "tokio/time"]
+# FakeMeros: the services in memory, for app tests with no network.
+fake = ["dep:ed25519-dalek"]
+
+[dependencies]
+base64 = "0.22"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+url = "2"
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+ed25519-dalek = { version = "2", optional = true }
+
+[dev-dependencies]
+ed25519-dalek = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
