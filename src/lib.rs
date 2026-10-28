@@ -23,11 +23,19 @@
 //! [`Transport`]; errors carry the server's code unchanged in
 //! [`Error::code`].
 
+pub mod auth;
 pub mod device;
 pub mod environment;
 pub mod error;
 pub mod http;
 
+#[cfg(feature = "loopback")]
+pub mod loopback;
+
+pub use auth::{
+    AccessTokenSource, AuthConfig, MemoryTokenStore, MerosAuth, MerosUser, Pkce, StaticToken,
+    TokenStore,
+};
 #[cfg(any(test, feature = "fake"))]
 pub use device::testing;
 pub use device::{DeviceIdentity, DeviceSigner, LicenseDevice};
