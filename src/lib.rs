@@ -31,6 +31,7 @@ pub mod error;
 pub mod events;
 pub mod http;
 pub mod license;
+pub mod server;
 pub mod support;
 
 #[cfg(feature = "loopback")]
@@ -63,6 +64,9 @@ pub use http::ReqwestTransport;
 pub use http::{BoxFuture, HttpRequest, HttpResponse, Transport};
 pub use license::{
     AuthResult, LicenseClient, LicenseConfig, LicenseLink, LicenseSeat, SignInClaim,
+};
+pub use server::{
+    ServerConfig, ServerDevice, ServerLicence, ServerLicenseClient, ServerRenewal, verify_licence,
 };
 pub use support::{
     AccountSupportApi, MemoryTicketSeenStore, ReplyTracker, SupportApi, SupportInbox,

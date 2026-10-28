@@ -26,6 +26,19 @@ use crate::http::{BoxFuture, HttpRequest, HttpResponse, Transport};
 
 /// Where the fake's signed upload and download URLs point.
 pub const BUCKET_HOST: &str = "bucket.test";
+/// The `kid` the fake signs Server statements with.
+pub const SERVER_KID: &str = "fake-server-1";
+const SERVER_SEED: [u8; 32] = [9; 32];
+
+/// The fake's Server statement key table, for [`crate::verify_licence`].
+pub fn server_keys() -> Vec<(&'static str, String)> {
+    let key = ed25519_dalek::SigningKey::from_bytes(&SERVER_SEED);
+    vec![(
+        SERVER_KID,
+        URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+    )]
+}
+
 /// The personal account's id.
 pub const PERSONAL: &str = "acct-personal";
 
@@ -77,6 +90,17 @@ pub struct FakeState {
     /// Suspended keys (reversible): activation and renewal are refused with
     /// `403 license_key_disabled`, and a device keeps its token.
     pub suspended_keys: HashSet<String>,
+    /// Server keys and the account owning each (`UNOWNED` for a guest
+    /// store purchase). One instance at a time per key; no offline
+    /// activation.
+    pub server_keys: HashMap<String, String>,
+    /// Which instance holds each Server key.
+    pub server_key_holders: HashMap<String, String>,
+    /// Whether login tokens carry `licenses:activate`; without it
+    /// `/v1/server/activate` answers `403 insufficient_scope`.
+    pub licenses_scope: bool,
+    /// The `updates_until` Server statements carry.
+    pub updates_until: String,
     /// Keys no account owns yet (a guest purchase). A device activated with
     /// one, or through the App Store, holds an unowned seat that the next
     /// account claim adopts into the signed-in account.
@@ -155,6 +179,10 @@ impl Default for FakeState {
             suspended_keys: HashSet::new(),
             revoked_keys: HashSet::new(),
             unowned_keys: HashSet::new(),
+            server_keys: HashMap::new(),
+            server_key_holders: HashMap::new(),
+            licenses_scope: true,
+            updates_until: "2027-10-17".into(),
             device_keys: HashMap::new(),
             devices: HashMap::new(),
             credentials: None,
@@ -356,7 +384,7 @@ impl FakeMeros {
             ["app", _, "v1", rest @ ..] | ["v1", rest @ ..]
                 if matches!(
                     rest.first(),
-                    Some(&("device" | "offline" | "apple" | "account"))
+                    Some(&("device" | "offline" | "apple" | "account" | "server"))
                 ) || rest.starts_with(&["support", "tickets"]) =>
             {
                 device_api(&mut st, &r, rest)
@@ -533,6 +561,126 @@ fn seat_for(st: &mut FakeState, device: &Value, account: &str) -> Result<(), Htt
     Ok(())
 }
 
+/// Puts the instance on `key`'s seat for `account`, replacing any seat it
+/// held.
+fn server_seat(st: &mut FakeState, device: &Value, account: &str, key: &str) {
+    let id = s(device, "id");
+    let pubkey = s(device, "pubkey");
+    st.seats.retain(|x| x["device_id"] != id);
+    st.server_key_holders.retain(|_, h| *h != id);
+    let (account_name, account_type) = account_label(st, account);
+    let seat_id = (st.seats.len() + st.released.len() + 1) as i64;
+    let time = st.time();
+    st.seats.push(json!({
+        "seat_id": seat_id,
+        "device_id": id,
+        "name": device.get("name"),
+        "model": device.get("model"),
+        "activated_at": time,
+        "last_seen_at": time,
+        "account_id": account,
+        "account_name": account_name,
+        "account_type": account_type,
+        "can_release": st.can_release,
+    }));
+    st.server_key_holders.insert(key.to_string(), id.clone());
+    st.device_keys.insert(id.clone(), key.to_string());
+    if !pubkey.is_empty() {
+        st.devices.entry(id.clone()).or_insert(pubkey);
+    }
+    st.released.remove(&id);
+}
+
+/// `/v1/server/activate` for `account`: the key the instance holds if it's
+/// that account's, an unowned key adopted, or the account's first free key.
+fn server_activate(st: &mut FakeState, device: &Value, account: &str) -> HttpResponse {
+    let id = s(device, "id");
+    let pubkey = s(device, "pubkey");
+    let registered = st.devices.get(&id).cloned();
+    let held =
+        st.device_keys.get(&id).cloned().filter(|k| {
+            st.server_keys.contains_key(k) && st.server_key_holders.get(k) == Some(&id)
+        });
+    if let Some(key) = held {
+        let owner = st.server_keys[&key].clone();
+        let same_install = registered.as_deref() == Some(pubkey.as_str());
+        if owner == account {
+            server_seat(st, device, account, &key);
+            return server_reply(st, &id);
+        }
+        if !same_install {
+            return reply(
+                409,
+                json!({"error": "device_id_in_use", "message": "This device is using a license on another account. Release it there first."}),
+            );
+        }
+        if owner == UNOWNED {
+            // A guest purchase moves to the account: the same key and seat.
+            st.server_keys.insert(key.clone(), account.to_string());
+            server_seat(st, device, account, &key);
+            return server_reply(st, &id);
+        }
+    }
+    let free = st
+        .server_keys
+        .iter()
+        .filter(|(k, owner)| owner.as_str() == account && !st.server_key_holders.contains_key(*k))
+        .map(|(k, _)| k.clone())
+        .min();
+    let Some(key) = free else {
+        return reply(
+            404,
+            json!({"error": "no_licence", "message": "This account has no free Server license. Buy one, or release one, at https://store.example.test."}),
+        );
+    };
+    server_seat(st, device, account, &key);
+    server_reply(st, &id)
+}
+
+/// `{token, entitlement_token, licence}` for an instance holding a seat.
+fn server_reply(st: &mut FakeState, device_id: &str) -> HttpResponse {
+    use ed25519_dalek::Signer;
+    let token = st.mint_token(device_id);
+    let seat = st
+        .seats
+        .iter()
+        .find(|x| x["device_id"] == device_id)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let key = st.device_keys.get(device_id).cloned().unwrap_or_default();
+    let jti = st.next();
+    let payload = json!({
+        "v": 1,
+        "typ": "server_licence",
+        "kid": SERVER_KID,
+        "jti": format!("jti-{jti}"),
+        "product": "example-app",
+        "edition": "server",
+        "account_id": seat["account_id"],
+        "account_type": seat["account_type"],
+        "account_name": seat["account_name"],
+        "license_id": format!("lic-{key}"),
+        "seat_id": seat["seat_id"],
+        "device_id": device_id,
+        "device_pubkey": st.devices.get(device_id).cloned().unwrap_or_default(),
+        "iat": st.clock,
+        "licence": "perpetual",
+        "updates_until": st.updates_until,
+        "features": {},
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let sig = ed25519_dalek::SigningKey::from_bytes(&SERVER_SEED).sign(&bytes);
+    let licence = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(&bytes),
+        URL_SAFE_NO_PAD.encode(sig.to_bytes())
+    );
+    reply(
+        200,
+        json!({"token": token, "entitlement_token": token, "licence": licence}),
+    )
+}
+
 fn entitlement(st: &mut FakeState, device_id: &str) -> HttpResponse {
     let token = st.mint_token(device_id);
     reply(200, json!({"token": token, "entitlement_token": token}))
@@ -562,6 +710,56 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
     };
 
     match (r.method.as_str(), rest) {
+        ("POST", ["device", "activate"]) | ("POST", ["offline", "activate"])
+            if st.server_keys.contains_key(&s(&body, "license_key")) =>
+        {
+            let key = s(&body, "license_key");
+            if st.suspended_keys.contains(&key) || st.revoked_keys.contains(&key) {
+                return err(403, "license_key_disabled");
+            }
+            if rest[0] == "offline" {
+                return reply(
+                    403,
+                    json!({"error": "offline_not_allowed", "message": "A Server license must be activated online."}),
+                );
+            }
+            if !self_signed("/v1/device/activate") {
+                return err(401, "bad_signature");
+            }
+            let d = body["device"].clone();
+            let id = s(&d, "id");
+            if let Some(holder) = st.server_key_holders.get(&key).filter(|h| **h != id) {
+                return reply(
+                    409,
+                    json!({"error": "no_seats_available", "message": format!("This license is in use on {holder}.")}),
+                );
+            }
+            let owner = st.server_keys[&key].clone();
+            server_seat(st, &d, &owner, &key);
+            server_reply(st, &id)
+        }
+        ("POST", ["server", "activate"]) => {
+            if !bearer.as_ref().is_some_and(|b| st.access.contains(b)) {
+                return reply(401, json!({"message": "Unauthenticated."}));
+            }
+            if !st.licenses_scope {
+                return err(403, "insufficient_scope");
+            }
+            if st.unknown_products.contains(&s(&body, "product")) {
+                return err(404, "unknown_product");
+            }
+            if !self_signed(&path) {
+                return err(401, "bad_signature");
+            }
+            let account = match body.get("account_id").and_then(|a| a.as_str()) {
+                Some(a) if a != PERSONAL && Some(a) != st.team.as_deref() => {
+                    return err(403, "forbidden");
+                }
+                Some(a) => a.to_string(),
+                None => claim_account(st),
+            };
+            server_activate(st, &body["device"].clone(), &account)
+        }
         ("POST", ["device", "activate"]) | ("POST", ["offline", "activate"]) => {
             let key = s(&body, "license_key");
             if !st.license_keys.contains(&key) {
@@ -615,6 +813,7 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             }
             if rest[1] == "release" {
                 st.seats.retain(|x| x["device_id"] != id);
+                st.server_key_holders.retain(|_, h| *h != id);
                 st.devices.remove(&id);
                 return reply(200, json!({"released": true}));
             }
@@ -628,6 +827,9 @@ fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpRespons
             }
             if st.suspended_keys.contains(&key) {
                 return err(403, "license_key_disabled");
+            }
+            if st.server_keys.contains_key(&key) {
+                return server_reply(st, &id);
             }
             entitlement(st, &id)
         }

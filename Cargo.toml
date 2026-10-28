@@ -22,7 +22,7 @@ events-runtime = ["tokio/rt", "tokio/time"]
 # key and entitlement.
 entitlement = ["dep:meros-entitlement"]
 # FakeMeros: the services in memory, for app tests with no network.
-fake = ["dep:ed25519-dalek"]
+fake = []
 
 [dependencies]
 base64 = "0.22"
@@ -33,7 +33,7 @@ sha2 = "0.10"
 tokio = { version = "1", default-features = false, features = ["sync"] }
 url = "2"
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
-ed25519-dalek = { version = "2", optional = true }
+ed25519-dalek = "2"
 meros-entitlement = { git = "https://github.com/meros-co/entitlements.git", branch = "main", optional = true }
 
 [dev-dependencies]
@@ -63,4 +63,8 @@ required-features = ["fake", "events-runtime"]
 
 [[test]]
 name = "staging"
+required-features = ["fake"]
+
+[[test]]
+name = "server"
 required-features = ["fake"]
