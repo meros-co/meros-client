@@ -28,6 +28,7 @@ pub mod cloud;
 pub mod device;
 pub mod environment;
 pub mod error;
+pub mod events;
 pub mod http;
 pub mod license;
 pub mod support;
@@ -48,6 +49,10 @@ pub use device::testing;
 pub use device::{DeviceIdentity, DeviceSigner, LicenseDevice};
 pub use environment::Environment;
 pub use error::Error;
+pub use events::{
+    Actor, Collector, Emitter, EmitterConfig, Envelope, Event, FlushReport, Severity, Source,
+    Subject,
+};
 #[cfg(feature = "reqwest")]
 pub use http::ReqwestTransport;
 pub use http::{BoxFuture, HttpRequest, HttpResponse, Transport};
