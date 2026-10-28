@@ -24,6 +24,7 @@
 //! [`Error::code`].
 
 pub mod auth;
+pub mod cloud;
 pub mod device;
 pub mod environment;
 pub mod error;
@@ -36,6 +37,10 @@ pub mod loopback;
 pub use auth::{
     AccessTokenSource, AuthConfig, MemoryTokenStore, MerosAuth, MerosUser, Pkce, StaticToken,
     TokenStore,
+};
+pub use cloud::{
+    MerosAccount, MerosCloud, MerosDoc, MerosDocInfo, MerosDocVersion, MerosFile, MerosProfile,
+    file_hash,
 };
 #[cfg(any(test, feature = "fake"))]
 pub use device::testing;
