@@ -68,3 +68,12 @@ required-features = ["fake"]
 [[test]]
 name = "server"
 required-features = ["fake"]
+
+# Keep debug builds small: no incremental cache, line tables only for our
+# code, and no debug info for dependencies.
+[profile.dev]
+incremental = false
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
