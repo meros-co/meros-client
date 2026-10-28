@@ -10,7 +10,7 @@ Flutter apps call it from their Rust core through flutter_rust_bridge.
 | `auth` | Sign in with Meros: authorization code with PKCE (S256), rotating refresh tokens kept in the app's `TokenStore`, and sign-out by revocation |
 | `loopback` | The desktop loopback redirect (RFC 8252). Feature `loopback` |
 | `cloud` | Meros Cloud: profiles, versioned documents, files (signed-URL upload and checked download), accounts and entitlements |
-| `support` | Support tickets, push-token registration, the unread inbox, a new-reply tracker for platforms without push, and support deep links |
+| `support` | Support tickets over the device API (`SupportApi`) or as the signed-in user for apps without a device license (`AccountSupportApi`), push-token registration, the unread inbox, a new-reply tracker for platforms without push, and support deep links |
 | `events` | The Meros Event Envelope v1 (`meros-co/meros-event-spec` v0.1.1): a capped local NDJSON log, and batched delivery to collectors. Feature `events-runtime` adds periodic delivery on Tokio |
 | `fake` | `FakeMeros`: all of the services in memory as a `Transport`, for app tests with no network. Feature `fake` |
 

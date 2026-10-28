@@ -61,6 +61,7 @@ pub use http::ReqwestTransport;
 pub use http::{BoxFuture, HttpRequest, HttpResponse, Transport};
 pub use license::{AuthResult, LicenseClient, LicenseConfig, LicenseLink, LicenseSeat};
 pub use support::{
-    MemoryTicketSeenStore, ReplyTracker, SupportApi, SupportInbox, SupportMessage, SupportThread,
-    SupportTicket, TicketSeenStore, TicketStatus, support_ticket_id_from_uri,
+    AccountSupportApi, MemoryTicketSeenStore, ReplyTracker, SupportApi, SupportInbox,
+    SupportMessage, SupportThread, SupportTicket, TicketSeenStore, TicketStatus,
+    support_ticket_id_from_uri,
 };

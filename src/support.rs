@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::Error;
+use crate::auth::AccessTokenSource;
 use crate::device::DeviceSigner;
 use crate::http::{HttpRequest, HttpResponse, Transport, segment, unix_now};
 
@@ -188,13 +189,6 @@ impl SupportApi {
         Ok(r)
     }
 
-    fn ticket_of(r: &HttpResponse) -> Result<SupportTicket, Error> {
-        r.value()
-            .get("ticket")
-            .and_then(SupportTicket::from_json)
-            .ok_or_else(|| Error::new(Some(r.status), "bad_response", "No ticket returned."))
-    }
-
     /// Files a ticket. `diagnostics` (optional) goes with the first message.
     ///
     /// The subject must be one line and the text free of control characters
@@ -214,7 +208,7 @@ impl SupportApi {
         if let Some(d) = diagnostics.filter(|d| !d.is_empty()) {
             body["app_diagnostics"] = json!(d);
         }
-        Self::ticket_of(&self.post("/v1/support/tickets", body).await?)
+        ticket_of(&self.post("/v1/support/tickets", body).await?)
     }
 
     /// The device's tickets.
@@ -231,32 +225,7 @@ impl SupportApi {
         let r = self
             .get(&format!("/v1/support/tickets/{}", segment(id)))
             .await?;
-        let j = r.value();
-        #[derive(Deserialize)]
-        struct M {
-            #[serde(default)]
-            author: Option<String>,
-            #[serde(default)]
-            body: Option<String>,
-            #[serde(default)]
-            at: Option<i64>,
-        }
-        let messages = j
-            .get("messages")
-            .cloned()
-            .and_then(|m| serde_json::from_value::<Vec<M>>(m).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| SupportMessage {
-                from_support: m.author.as_deref().unwrap_or("support") == "support",
-                body: m.body.unwrap_or_default(),
-                at: m.at.unwrap_or(0),
-            })
-            .collect();
-        Ok(SupportThread {
-            ticket: Self::ticket_of(&r)?,
-            messages,
-        })
+        thread_of(&r)
     }
 
     /// Replies on a ticket (reopening a closed one). The text must be free
@@ -270,7 +239,7 @@ impl SupportApi {
             ));
         }
         let path = format!("/v1/support/tickets/{}/messages", segment(id));
-        Self::ticket_of(&self.post(&path, json!({"message": message})).await?)
+        ticket_of(&self.post(&path, json!({"message": message})).await?)
     }
 
     /// Registers the device's push token for support-reply notifications;
@@ -282,6 +251,184 @@ impl SupportApi {
         }
         let body = json!({"platform": platform, "token": token, "app_version": self.app_version});
         self.post("/v1/device/push-token", body).await.map(|_| ())
+    }
+}
+
+fn ticket_of(r: &HttpResponse) -> Result<SupportTicket, Error> {
+    r.value()
+        .get("ticket")
+        .and_then(SupportTicket::from_json)
+        .ok_or_else(|| Error::new(Some(r.status), "bad_response", "No ticket returned."))
+}
+
+fn tickets_of(r: &HttpResponse) -> Vec<SupportTicket> {
+    r.value()
+        .get("tickets")
+        .and_then(|t| t.as_array())
+        .map(|a| a.iter().filter_map(SupportTicket::from_json).collect())
+        .unwrap_or_default()
+}
+
+fn thread_of(r: &HttpResponse) -> Result<SupportThread, Error> {
+    #[derive(Deserialize)]
+    struct M {
+        #[serde(default)]
+        author: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        at: Option<i64>,
+    }
+    let messages = r
+        .value()
+        .get("messages")
+        .cloned()
+        .and_then(|m| serde_json::from_value::<Vec<M>>(m).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| SupportMessage {
+            from_support: m.author.as_deref().unwrap_or("support") == "support",
+            body: m.body.unwrap_or_default(),
+            at: m.at.unwrap_or(0),
+        })
+        .collect();
+    Ok(SupportThread {
+        ticket: ticket_of(r)?,
+        messages,
+    })
+}
+
+/// Support tickets for apps without a device license, as the signed-in user
+/// (Sign in with Meros, scope `support:write`): `{base}/v1/support/{product}/
+/// tickets`. Without a token the service answers `401`, without the scope
+/// `403`; unknown products and tickets are `unknown_product` and
+/// `unknown_ticket`. Each request retries once with a fresh token on 401.
+/// There is no push: refresh on launch and resume.
+pub struct AccountSupportApi {
+    /// The issuer, such as the staging or production meros.co origin.
+    pub base_url: String,
+    /// The product's id, such as the app's own slug.
+    pub product: String,
+    transport: Arc<dyn Transport>,
+    token: Arc<dyn AccessTokenSource>,
+}
+
+/// The service's text limits for signed-in tickets, in characters.
+pub const SUBJECT_MAX: usize = 150;
+pub const MESSAGE_MAX: usize = 10_000;
+pub const DIAGNOSTICS_MAX: usize = 20_000;
+
+impl AccountSupportApi {
+    pub fn new(
+        base_url: impl Into<String>,
+        product: impl Into<String>,
+        transport: Arc<dyn Transport>,
+        token: Arc<dyn AccessTokenSource>,
+    ) -> Self {
+        AccountSupportApi {
+            base_url: base_url.into(),
+            product: product.into(),
+            transport,
+            token,
+        }
+    }
+
+    fn url(&self, rest: &str) -> String {
+        format!(
+            "{}/v1/support/{}/tickets{rest}",
+            self.base_url,
+            segment(&self.product)
+        )
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        url: String,
+        body: Option<&Value>,
+    ) -> Result<HttpResponse, Error> {
+        let request = |token: String| {
+            let mut r = HttpRequest::new(method, url.clone())
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Accept", "application/json");
+            if let Some(b) = body {
+                r = r.json(b);
+            }
+            r
+        };
+        let mut r = self
+            .transport
+            .send(request(self.token.access_token(false).await?))
+            .await?;
+        if r.status == 401 {
+            r = self
+                .transport
+                .send(request(self.token.access_token(true).await?))
+                .await?;
+        }
+        if !r.ok() {
+            return Err(Error::from_response(&r));
+        }
+        Ok(r)
+    }
+
+    /// Files a ticket, with the same checks as [`SupportApi::create`] plus
+    /// the service's length limits. A resend within a day returns the
+    /// first ticket.
+    pub async fn create(
+        &self,
+        subject: &str,
+        message: &str,
+        diagnostics: Option<&str>,
+    ) -> Result<SupportTicket, Error> {
+        validate(subject, message)?;
+        if subject.chars().count() > SUBJECT_MAX {
+            return Err(invalid("invalid_subject", "The subject is too long."));
+        }
+        if message.chars().count() > MESSAGE_MAX {
+            return Err(invalid("invalid_message", "The message is too long."));
+        }
+        let mut body = json!({"subject": subject, "message": message});
+        if let Some(d) = diagnostics.filter(|d| !d.is_empty()) {
+            if d.chars().count() > DIAGNOSTICS_MAX || !clean(d, true) {
+                return Err(invalid(
+                    "invalid_diagnostics",
+                    "The diagnostics can't be sent.",
+                ));
+            }
+            body["app_diagnostics"] = json!(d);
+        }
+        ticket_of(&self.send("POST", self.url(""), Some(&body)).await?)
+    }
+
+    /// The user's tickets for this product.
+    pub async fn list(&self) -> Result<Vec<SupportTicket>, Error> {
+        Ok(tickets_of(&self.send("GET", self.url(""), None).await?))
+    }
+
+    /// A ticket and its messages.
+    pub async fn thread(&self, id: &str) -> Result<SupportThread, Error> {
+        thread_of(
+            &self
+                .send("GET", self.url(&format!("/{}", segment(id))), None)
+                .await?,
+        )
+    }
+
+    /// Replies on a ticket (reopening a closed one).
+    pub async fn reply(&self, id: &str, message: &str) -> Result<SupportTicket, Error> {
+        if !clean(message, true) || message.chars().count() > MESSAGE_MAX {
+            return Err(invalid(
+                "invalid_message",
+                "The message can't be sent as written.",
+            ));
+        }
+        let url = self.url(&format!("/{}/messages", segment(id)));
+        ticket_of(
+            &self
+                .send("POST", url, Some(&json!({"message": message})))
+                .await?,
+        )
     }
 }
 

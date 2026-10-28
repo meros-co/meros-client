@@ -100,6 +100,11 @@ pub struct FakeState {
     pub push_tokens: Vec<(String, String, String)>,
     /// Refuses support requests with `429 rate_limited`.
     pub support_rate_limited: bool,
+    /// Products the signed-in ticket API refuses as `unknown_product`.
+    pub unknown_products: BTreeSet<String>,
+    /// Whether signed-in tokens carry `support:write`; without it the
+    /// signed-in ticket API answers `403 insufficient_scope`.
+    pub support_scope: bool,
     /// Tickets a device may have open (not closed).
     pub open_ticket_cap: usize,
     /// Events ingested, as received.
@@ -146,6 +151,8 @@ impl Default for FakeState {
             tickets: Vec::new(),
             push_tokens: Vec::new(),
             support_rate_limited: false,
+            unknown_products: BTreeSet::new(),
+            support_scope: true,
             open_ticket_cap: 10,
             events: Vec::new(),
             event_batch_cap: 500,
@@ -327,8 +334,8 @@ impl FakeMeros {
             ["app", _, "v1", rest @ ..] | ["v1", rest @ ..]
                 if matches!(
                     rest.first(),
-                    Some(&("device" | "offline" | "apple" | "account" | "support"))
-                ) =>
+                    Some(&("device" | "offline" | "apple" | "account"))
+                ) || rest.starts_with(&["support", "tickets"]) =>
             {
                 device_api(&mut st, &r, rest)
             }
@@ -690,8 +697,21 @@ fn support_api(
     if !signed(&key, method, path, &id, ts, &sig) {
         return err(401, "bad_signature");
     }
+    tickets(st, &id, method, &rest[2..], body)
+}
+
+/// The ticket store both support APIs share; `owner` is the device id or,
+/// for the signed-in API, the user and product.
+fn tickets(
+    st: &mut FakeState,
+    owner: &str,
+    method: &str,
+    rest: &[&str],
+    body: &Value,
+) -> HttpResponse {
+    let id = owner.to_string();
     let clock = st.clock;
-    match (method, &rest[2..]) {
+    match (method, rest) {
         _ if st.support_rate_limited => reply(
             429,
             json!({"error": "rate_limited", "message": "Too many requests. Try again later."}),
@@ -850,6 +870,15 @@ fn cloud(
             )
         }
         ("POST", ["v1", "events"]) => ingest(st, &body),
+        (method, ["v1", "support", product, "tickets", rest @ ..]) => {
+            if !st.support_scope {
+                return err(403, "insufficient_scope");
+            }
+            if st.unknown_products.contains(*product) {
+                return err(404, "unknown_product");
+            }
+            tickets(st, &format!("user:u1/{product}"), method, rest, &body)
+        }
         _ => err(404, "not_found"),
     }
 }

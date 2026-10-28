@@ -179,3 +179,100 @@ async fn a_service_at_its_own_root_works_too() {
     api.create("S", "m", None).await.unwrap();
     assert_eq!(api.list().await.unwrap().len(), 1);
 }
+
+mod signed_in {
+    use super::*;
+    use meros_client::AccountSupportApi;
+
+    async fn api(fake: &Arc<FakeMeros>) -> AccountSupportApi {
+        let a = signed_in(fake).await;
+        AccountSupportApi::new(ISSUER, "example-app", fake.clone(), a)
+    }
+
+    #[tokio::test]
+    async fn files_lists_and_replies_as_the_signed_in_user() {
+        let fake = FakeMeros::new();
+        let api = api(&fake).await;
+        let t = api
+            .create("Crash on export", "Steps…", Some("os: test"))
+            .await
+            .unwrap();
+        assert!(t.id.starts_with("tkt_"));
+        // A resend is the same ticket.
+        assert_eq!(
+            api.create("Crash on export", "Steps…", None)
+                .await
+                .unwrap()
+                .id,
+            t.id
+        );
+        let r = &fake.requests_to("/v1/support/example-app/tickets")[0];
+        assert!(
+            r.header_value("Authorization")
+                .unwrap()
+                .starts_with("Bearer at")
+        );
+        assert_eq!(r.json_body().unwrap()["app_diagnostics"], "os: test");
+
+        fake.support_replies(&t.id, "Fixed in the next build.");
+        let thread = api.thread(&t.id).await.unwrap();
+        assert_eq!(thread.ticket.status, TicketStatus::Pending);
+        assert_eq!(
+            thread
+                .messages
+                .iter()
+                .map(|m| m.from_support)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(
+            api.reply(&t.id, "Thanks").await.unwrap().status,
+            TicketStatus::Open
+        );
+        assert_eq!(api.list().await.unwrap().len(), 1);
+        assert_eq!(
+            api.thread("tkt_none").await.unwrap_err().code,
+            "unknown_ticket"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusals_keep_their_codes_and_a_stale_token_is_renewed_once() {
+        let fake = FakeMeros::new();
+        let api = api(&fake).await;
+        fake.state().expire_access_tokens();
+        assert!(api.list().await.unwrap().is_empty());
+        assert_eq!(fake.requests_to("/v1/support/example-app/tickets").len(), 2);
+
+        assert_eq!(
+            api.create("Two\nlines", "m", None).await.unwrap_err().code,
+            "invalid_subject"
+        );
+        let long = "x".repeat(meros_client::support::SUBJECT_MAX + 1);
+        assert_eq!(
+            api.create(&long, "m", None).await.unwrap_err().code,
+            "invalid_subject"
+        );
+
+        fake.state().support_rate_limited = true;
+        assert!(api.list().await.unwrap_err().rate_limited());
+        fake.state().support_rate_limited = false;
+        fake.state().unknown_products.insert("example-app".into());
+        assert_eq!(api.list().await.unwrap_err().code, "unknown_product");
+        fake.state().unknown_products.clear();
+        fake.state().support_scope = false;
+        let e = api.list().await.unwrap_err();
+        assert_eq!(
+            (e.status, e.code.as_str()),
+            (Some(403), "insufficient_scope")
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_out_users_get_signed_out_not_a_request() {
+        let fake = FakeMeros::new();
+        let api = AccountSupportApi::new(ISSUER, "example-app", fake.clone(), auth(&fake));
+        assert_eq!(api.list().await.unwrap_err().code, "signed_out");
+        assert!(fake.requests_to("/tickets").is_empty());
+    }
+}
