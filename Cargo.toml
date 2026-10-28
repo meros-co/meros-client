@@ -56,3 +56,7 @@ required-features = ["fake"]
 [[test]]
 name = "events"
 required-features = ["fake", "events-runtime"]
+
+[[test]]
+name = "staging"
+required-features = ["fake"]
