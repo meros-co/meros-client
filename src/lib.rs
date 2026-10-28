@@ -28,6 +28,7 @@ pub mod device;
 pub mod environment;
 pub mod error;
 pub mod http;
+pub mod license;
 
 #[cfg(feature = "loopback")]
 pub mod loopback;
@@ -44,3 +45,4 @@ pub use error::Error;
 #[cfg(feature = "reqwest")]
 pub use http::ReqwestTransport;
 pub use http::{BoxFuture, HttpRequest, HttpResponse, Transport};
+pub use license::{AuthResult, LicenseClient, LicenseConfig, LicenseLink, LicenseSeat};
