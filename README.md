@@ -96,7 +96,7 @@ On desktop, sign in through a loopback redirect:
 
 ```rust,ignore
 # async fn run(auth: &meros_client::MerosAuth) -> Result<(), meros_client::Error> {
-let redirect = meros_client::loopback::LoopbackRedirect::bind("/callback").await?;
+let redirect = meros_client::loopback::LoopbackRedirect::bind().await?;
 let page = auth.begin_sign_in_with(redirect.redirect_uri()).await;
 // open `page` in the browser
 let callback = redirect.wait(std::time::Duration::from_secs(300)).await?;

@@ -145,7 +145,7 @@ async fn a_revoked_session_signs_out_and_sign_out_revokes() {
 async fn a_loopback_redirect_completes_a_desktop_sign_in() {
     let fake = FakeMeros::new();
     let a = auth(&fake);
-    let lb = meros_client::loopback::LoopbackRedirect::bind("/callback")
+    let lb = meros_client::loopback::LoopbackRedirect::bind()
         .await
         .unwrap();
     let page = a.begin_sign_in_with(lb.redirect_uri()).await;

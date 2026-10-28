@@ -9,6 +9,9 @@ use tokio::net::TcpListener;
 
 use crate::Error;
 
+/// The loopback redirect path Meros desktop clients are registered with.
+pub const CALLBACK_PATH: &str = "/callback";
+
 /// A listener waiting for one sign-in redirect.
 pub struct LoopbackRedirect {
     listener: TcpListener,
@@ -17,9 +20,15 @@ pub struct LoopbackRedirect {
 }
 
 impl LoopbackRedirect {
-    /// Listens on `127.0.0.1` at a free port for redirects to `path` (such as
-    /// `/callback`).
-    pub async fn bind(path: &str) -> Result<LoopbackRedirect, Error> {
+    /// Listens on `127.0.0.1` at a free port for redirects to
+    /// [`CALLBACK_PATH`], the path the Meros desktop clients are registered
+    /// with (`http://127.0.0.1/callback`, any port).
+    pub async fn bind() -> Result<LoopbackRedirect, Error> {
+        Self::bind_path(CALLBACK_PATH).await
+    }
+
+    /// Like [`bind`](Self::bind), for an issuer registered with another path.
+    pub async fn bind_path(path: &str) -> Result<LoopbackRedirect, Error> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
             Error::new(
                 None,
@@ -121,7 +130,7 @@ mod tests {
 
     #[tokio::test]
     async fn takes_the_redirect_and_ignores_other_paths() {
-        let lb = LoopbackRedirect::bind("callback").await.unwrap();
+        let lb = LoopbackRedirect::bind().await.unwrap();
         let uri = lb.redirect_uri().to_string();
         assert!(uri.starts_with("http://127.0.0.1:") && uri.ends_with("/callback"));
         let addr = uri
@@ -143,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn gives_up_after_the_timeout() {
-        let lb = LoopbackRedirect::bind("/cb").await.unwrap();
+        let lb = LoopbackRedirect::bind_path("cb").await.unwrap();
         let e = lb.wait(Duration::from_millis(50)).await.unwrap_err();
         assert_eq!(e.code, "timeout");
     }
