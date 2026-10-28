@@ -142,6 +142,8 @@ struct Session {
     generation: u64,
 }
 
+type UserHook = Arc<dyn Fn(Option<MerosUser>) + Send + Sync>;
+
 // The same keys the Dart client used, so a stored session carries over.
 const REFRESH_KEY: &str = "meros.refresh_token";
 const USER_KEY: &str = "meros.user";
@@ -156,6 +158,7 @@ pub struct MerosAuth {
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     session: Mutex<Session>,
     refreshing: tokio::sync::Mutex<()>,
+    on_user_changed: Option<UserHook>,
 }
 
 impl MerosAuth {
@@ -171,10 +174,27 @@ impl MerosAuth {
             now: Arc::new(unix_now),
             session: Mutex::new(Session::default()),
             refreshing: tokio::sync::Mutex::new(()),
+            on_user_changed: None,
         }
     }
 
     /// Replaces the clock (unix seconds), for tests.
+    /// Called with the new user (None when signed out) whenever the session
+    /// changes: a sign-in, a sign-out, or a refresh the issuer refused.
+    pub fn on_user_changed(
+        mut self,
+        hook: impl Fn(Option<MerosUser>) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_user_changed = Some(Arc::new(hook));
+        self
+    }
+
+    fn user_changed(&self, user: Option<MerosUser>) {
+        if let Some(h) = &self.on_user_changed {
+            h(user);
+        }
+    }
+
     pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
         self.now = Arc::new(now);
         self
@@ -330,6 +350,8 @@ impl MerosAuth {
         let mut s = self.session.lock().unwrap();
         s.user = Some(user.clone());
         s.loaded = true;
+        drop(s);
+        self.user_changed(Some(user.clone()));
         Ok(user)
     }
 
@@ -434,13 +456,16 @@ impl MerosAuth {
     }
 
     async fn clear(&self) {
-        {
+        let had_user = {
             let mut s = self.session.lock().unwrap();
             s.access = None;
-            s.user = None;
-        }
+            s.user.take().is_some()
+        };
         self.store.write(REFRESH_KEY, None).await;
         self.store.write(USER_KEY, None).await;
+        if had_user {
+            self.user_changed(None);
+        }
     }
 }
 

@@ -174,3 +174,22 @@ async fn a_loopback_redirect_completes_a_desktop_sign_in() {
     let fields: std::collections::HashMap<_, _> = token.form_fields().into_iter().collect();
     assert!(fields["redirect_uri"].starts_with("http://127.0.0.1:"));
 }
+
+#[tokio::test]
+async fn user_changes_are_reported_on_sign_in_sign_out_and_a_refused_refresh() {
+    let fake = FakeMeros::new();
+    let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+    let s = seen.clone();
+    let a = MerosAuth::new(
+        auth(&fake).config.clone(),
+        fake.clone(),
+        Arc::new(MemoryTokenStore::default()),
+    )
+    .on_user_changed(move |u| s.lock().unwrap().push(u.map(|u| u.id)));
+    let page = a.begin_sign_in().await;
+    a.complete_sign_in(&fake.approve(&page)).await.unwrap();
+    fake.state().revoke_session();
+    assert!(a.access_token(true).await.is_err());
+    a.sign_out().await; // already signed out: no second report
+    assert_eq!(*seen.lock().unwrap(), [Some("u1".to_string()), None]);
+}
