@@ -8,7 +8,8 @@
 //!   [`LicenseLink`] deep links.
 //! - [`MerosAuth`]: Sign in with Meros (authorization code with PKCE S256,
 //!   rotating refresh tokens in the app's [`TokenStore`]), with a
-//!   [`loopback`] redirect for desktop.
+//!   [`loopback`] redirect for desktop and the device authorization grant
+//!   (RFC 8628) for devices with no browser.
 //! - [`MerosCloud`]: profiles, versioned documents, files, accounts and
 //!   entitlements.
 //! - [`SupportApi`], [`SupportInbox`] and [`ReplyTracker`]: support tickets
@@ -41,8 +42,8 @@ pub mod loopback;
 pub mod fake;
 
 pub use auth::{
-    AccessTokenSource, AuthConfig, MemoryTokenStore, MerosAuth, MerosUser, Pkce, StaticToken,
-    TokenStore,
+    AccessTokenSource, AuthConfig, DeviceSignIn, Discovery, MemoryTokenStore, MerosAuth, MerosUser,
+    Pkce, StaticToken, TokenStore,
 };
 pub use cloud::{
     MerosAccount, MerosCloud, MerosDoc, MerosDocInfo, MerosDocVersion, MerosFile, MerosProfile,

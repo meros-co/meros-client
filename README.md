@@ -7,7 +7,7 @@ Flutter apps call it from their Rust core through flutter_rust_bridge.
 | Module | What it does |
 |---|---|
 | `license` | The device license API: activate with a key, renew, release, claim a seat by signing in (with TOTP), claim and list or release seats with the app's own sign-in, adopt an unowned license (guest or App Store purchase) into the account after sign-in (`adopt_after_sign_in`), App Store redeem, "manage online" and browser-claim links, offline activation blobs, and `activate`/`claim` deep links |
-| `auth` | Sign in with Meros: authorization code with PKCE (S256), rotating refresh tokens kept in the app's `TokenStore`, and sign-out by revocation |
+| `auth` | Sign in with Meros: authorization code with PKCE (S256), the device authorization grant (RFC 8628), rotating refresh tokens kept in the app's `TokenStore`, and sign-out by revocation. Endpoints come from the issuer's discovery document |
 | `server` | Server licenses: activate an instance with a key or a Meros login (which adopts an unowned key), renew daily with `410` vs `403` told apart, release and move, and verify the perpetual Server statement (`verify_licence`). No offline activation |
 | `loopback` | The desktop loopback redirect (RFC 8252). Feature `loopback` |
 | `cloud` | Meros Cloud: profiles, versioned documents, files (signed-URL upload and checked download), accounts and entitlements |
@@ -111,12 +111,32 @@ auth.complete_sign_in(&callback).await?;
 # Ok(()) }
 ```
 
+On a device with no browser, sign in with a code approved on another device
+(RFC 8628):
+
+```rust,ignore
+# async fn run(auth: &meros_client::MerosAuth) -> Result<(), meros_client::Error> {
+let mut sign_in = auth.begin_device_sign_in().await?;
+// show `sign_in.user_code` and `sign_in.verification_uri`
+// (or `verification_uri_complete` as a QR code)
+let user = loop {
+    tokio::time::sleep(std::time::Duration::from_secs(sign_in.interval)).await;
+    if let Some(user) = auth.poll_device_sign_in(&mut sign_in).await? {
+        break user;
+    }
+};
+# Ok(()) }
+```
+
+The poll fails with `expired_token` or `access_denied`; start again with a new
+code either way.
+
 ## Tests
 
 `cargo test --all-features` runs everything against `FakeMeros`. It checks
 device signatures for real, and the tests cover:
 
-- PKCE and refresh rotation;
+- PKCE, the device grant and refresh rotation;
 - seats, claim refusals, token expiry and the file quota;
 - damaged uploads;
 - document conflicts;

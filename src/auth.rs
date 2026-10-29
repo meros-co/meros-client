@@ -1,7 +1,9 @@
 //! "Sign in with Meros": OAuth 2.0 authorization code with PKCE (S256), a
 //! rotating refresh token kept in the app's [`TokenStore`], and sign-out by
 //! revocation. Mobile apps redirect to their own scheme; desktop apps use a
-//! loopback redirect (RFC 8252, see [`crate::loopback`]).
+//! loopback redirect (RFC 8252, see [`crate::loopback`]). Devices with no
+//! browser sign in with the device authorization grant (RFC 8628): they show
+//! a code and a link, and the person approves it on another device.
 
 use std::sync::{Arc, Mutex};
 
@@ -132,6 +134,45 @@ struct Pending {
     redirect_uri: Option<String>,
 }
 
+/// The issuer's endpoints, from its discovery document
+/// (`{issuer}/.well-known/openid-configuration`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Discovery {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    #[serde(default)]
+    pub device_authorization_endpoint: Option<String>,
+}
+
+/// A device sign-in in progress (RFC 8628): show [`user_code`] and
+/// [`verification_uri`] (or [`verification_uri_complete`] as a link or QR
+/// code), then call [`MerosAuth::poll_device_sign_in`] every [`interval`]
+/// seconds until it returns the user or fails.
+///
+/// [`user_code`]: Self::user_code
+/// [`verification_uri`]: Self::verification_uri
+/// [`verification_uri_complete`]: Self::verification_uri_complete
+/// [`interval`]: Self::interval
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSignIn {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    /// Seconds to wait between polls; raised when the issuer says
+    /// `slow_down`.
+    pub interval: u64,
+    /// When the codes stop working, unix seconds.
+    pub expires_at: i64,
+}
+
+const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
 #[derive(Default)]
 struct Session {
     access: Option<String>,
@@ -159,6 +200,17 @@ pub struct MerosAuth {
     session: Mutex<Session>,
     refreshing: tokio::sync::Mutex<()>,
     on_user_changed: Option<UserHook>,
+    discovery: Mutex<Endpoints>,
+}
+
+/// What discovery found: nothing yet, the document, or that the issuer has
+/// none (then the issuer's standard `/oauth/*` paths stand in).
+#[derive(Default, Clone)]
+enum Endpoints {
+    #[default]
+    Unknown,
+    Found(Discovery),
+    Missing,
 }
 
 impl MerosAuth {
@@ -175,6 +227,7 @@ impl MerosAuth {
             session: Mutex::new(Session::default()),
             refreshing: tokio::sync::Mutex::new(()),
             on_user_changed: None,
+            discovery: Mutex::new(Endpoints::Unknown),
         }
     }
 
@@ -202,6 +255,129 @@ impl MerosAuth {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.config.issuer)
+    }
+
+    /// One of the issuer's endpoints, from discovery; the issuer's standard
+    /// path when it publishes no discovery document, or while it can't be
+    /// reached (that request then fails offline anyway).
+    async fn endpoint_for(
+        &self,
+        pick: impl Fn(&Discovery) -> Option<String>,
+        standard: &str,
+    ) -> String {
+        match self.discover().await {
+            Ok(d) => pick(&d).unwrap_or_else(|| self.endpoint(standard)),
+            Err(_) => self.endpoint(standard),
+        }
+    }
+
+    /// The issuer's discovery document, read once and kept. An issuer
+    /// without one is remembered too, so it is asked only once.
+    pub async fn discover(&self) -> Result<Discovery, Error> {
+        match self.discovery.lock().unwrap().clone() {
+            Endpoints::Found(d) => return Ok(d),
+            Endpoints::Missing => return Err(no_discovery(None)),
+            Endpoints::Unknown => {}
+        }
+        let r = self
+            .transport
+            .send(
+                HttpRequest::new("GET", self.endpoint("/.well-known/openid-configuration"))
+                    .header("Accept", "application/json"),
+            )
+            .await?;
+        if r.status != 200 {
+            if r.status == 404 {
+                *self.discovery.lock().unwrap() = Endpoints::Missing;
+            }
+            return Err(no_discovery(Some(r.status)));
+        }
+        let d: Discovery = r.parse()?;
+        *self.discovery.lock().unwrap() = Endpoints::Found(d.clone());
+        Ok(d)
+    }
+
+    /// Starts a device sign-in (RFC 8628) at the issuer's
+    /// `device_authorization_endpoint`, asking for the configured scopes.
+    pub async fn begin_device_sign_in(&self) -> Result<DeviceSignIn, Error> {
+        let d = self.discover().await?;
+        let Some(endpoint) = d.device_authorization_endpoint else {
+            return Err(Error::new(
+                None,
+                "device_grant_unsupported",
+                "This sign-in service does not support signing in with a code.",
+            ));
+        };
+        let scope = self.config.scopes.join(" ");
+        let r = self
+            .transport
+            .send(HttpRequest::new("POST", endpoint).form(&[
+                ("client_id", self.config.client_id.as_str()),
+                ("scope", scope.as_str()),
+            ]))
+            .await?;
+        if r.status != 200 {
+            return Err(Error::from_response(&r));
+        }
+        #[derive(Deserialize)]
+        struct Codes {
+            device_code: String,
+            user_code: String,
+            verification_uri: String,
+            verification_uri_complete: Option<String>,
+            interval: Option<u64>,
+            expires_in: i64,
+        }
+        let c: Codes = r.parse()?;
+        Ok(DeviceSignIn {
+            device_code: c.device_code,
+            user_code: c.user_code,
+            verification_uri: c.verification_uri,
+            verification_uri_complete: c.verification_uri_complete,
+            // RFC 8628 section 3.2: 5 seconds when the issuer leaves it out.
+            interval: c.interval.unwrap_or(5).max(1),
+            expires_at: (self.now)() + c.expires_in,
+        })
+    }
+
+    /// Asks once whether the person has approved `sign_in`. `Ok(None)`
+    /// means not yet: wait `sign_in.interval` seconds (raised here when the
+    /// issuer says `slow_down`) and ask again. Fails with `expired_token`
+    /// once the codes run out and `access_denied` when the person declines;
+    /// start over with [`begin_device_sign_in`](Self::begin_device_sign_in)
+    /// either way. On approval the session is stored as for any sign-in.
+    pub async fn poll_device_sign_in(
+        &self,
+        sign_in: &mut DeviceSignIn,
+    ) -> Result<Option<MerosUser>, Error> {
+        if (self.now)() >= sign_in.expires_at {
+            return Err(expired(None));
+        }
+        match self
+            .token(&[
+                ("grant_type", DEVICE_CODE_GRANT),
+                ("device_code", &sign_in.device_code),
+                ("client_id", &self.config.client_id),
+            ])
+            .await
+        {
+            Ok(access) => self.signed_in_with(&access).await.map(Some),
+            Err(e) => match e.code.as_str() {
+                "authorization_pending" => Ok(None),
+                // RFC 8628 section 3.5: 5 seconds more from now on.
+                "slow_down" => {
+                    sign_in.interval += 5;
+                    Ok(None)
+                }
+                "expired_token" => Err(expired(e.status)),
+                "access_denied" => Err(Error::new(
+                    e.status,
+                    "access_denied",
+                    "Sign-in was declined.",
+                )),
+                _ => Err(e),
+            },
+        }
     }
 
     /// Reads the stored session. The other calls do it on first use; call it
@@ -254,8 +430,14 @@ impl MerosAuth {
             .write(PENDING_KEY, serde_json::to_string(&pending).ok())
             .await;
         let scope = self.config.scopes.join(" ");
+        let authorize = self
+            .endpoint_for(
+                |d| Some(d.authorization_endpoint.clone()),
+                "/oauth/authorize",
+            )
+            .await;
         with_query(
-            &self.endpoint("/oauth/authorize"),
+            &authorize,
             &[
                 ("response_type", "code"),
                 ("client_id", &self.config.client_id),
@@ -328,10 +510,18 @@ impl MerosAuth {
                 ("code_verifier", &pending.verifier),
             ])
             .await?;
+        self.signed_in_with(&access).await
+    }
+
+    /// Reads the account behind a new access token and stores the session.
+    async fn signed_in_with(&self, access: &str) -> Result<MerosUser, Error> {
+        let userinfo = self
+            .endpoint_for(|d| d.userinfo_endpoint.clone(), "/oauth/userinfo")
+            .await;
         let info = self
             .transport
             .send(
-                HttpRequest::new("GET", self.endpoint("/oauth/userinfo"))
+                HttpRequest::new("GET", userinfo)
                     .header("Authorization", format!("Bearer {access}"))
                     .header("Accept", "application/json"),
             )
@@ -404,9 +594,12 @@ impl MerosAuth {
     }
 
     async fn token(&self, form: &[(&str, &str)]) -> Result<String, Error> {
+        let endpoint = self
+            .endpoint_for(|d| Some(d.token_endpoint.clone()), "/oauth/token")
+            .await;
         let r = self
             .transport
-            .send(HttpRequest::new("POST", self.endpoint("/oauth/token")).form(form))
+            .send(HttpRequest::new("POST", endpoint).form(form))
             .await?;
         if r.status != 200 {
             let mut e = Error::from_response(&r);
@@ -444,10 +637,13 @@ impl MerosAuth {
             None => self.store.read(REFRESH_KEY).await,
         };
         if let Some(token) = token {
+            let revoke = self
+                .endpoint_for(|d| d.revocation_endpoint.clone(), "/oauth/revoke")
+                .await;
             let _ = self
                 .transport
                 .send(
-                    HttpRequest::new("POST", self.endpoint("/oauth/revoke"))
+                    HttpRequest::new("POST", revoke)
                         .form(&[("token", &token), ("client_id", &self.config.client_id)]),
                 )
                 .await;
@@ -473,6 +669,22 @@ impl AccessTokenSource for MerosAuth {
     fn access_token(&self, force: bool) -> BoxFuture<'_, Result<String, Error>> {
         Box::pin(MerosAuth::access_token(self, force))
     }
+}
+
+fn no_discovery(status: Option<u16>) -> Error {
+    Error::new(
+        status,
+        "discovery",
+        "Could not read the sign-in service's settings.",
+    )
+}
+
+fn expired(status: Option<u16>) -> Error {
+    Error::new(
+        status,
+        "expired_token",
+        "The sign-in code expired. Get a new one.",
+    )
 }
 
 /// A fixed bearer token, such as a collector's static token.

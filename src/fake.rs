@@ -156,6 +156,12 @@ pub struct FakeState {
     pub requests: Vec<HttpRequest>,
     /// The fake's clock, unix seconds.
     pub clock: i64,
+    /// Whether the issuer publishes a discovery document.
+    pub discovery: bool,
+    /// Whether discovery lists a `device_authorization_endpoint`.
+    pub device_grant: bool,
+    /// Device sign-ins (RFC 8628) by device code.
+    pub device_sign_ins: HashMap<String, FakeDeviceSignIn>,
     codes: HashMap<String, (String, String)>,
     refresh: HashSet<String>,
     access: HashSet<String>,
@@ -208,6 +214,9 @@ impl Default for FakeState {
             event_batch_cap: 500,
             requests: Vec::new(),
             clock: 1_792_238_400, // 2026-10-17 12:00 UTC
+            discovery: true,
+            device_grant: true,
+            device_sign_ins: HashMap::new(),
             codes: HashMap::new(),
             refresh: HashSet::new(),
             access: HashSet::new(),
@@ -267,6 +276,23 @@ impl FakeState {
     }
 }
 
+/// A device sign-in (RFC 8628) waiting at the fake.
+#[derive(Debug, Clone)]
+pub struct FakeDeviceSignIn {
+    pub user_code: String,
+    pub scope: String,
+    /// `None` while waiting; `Some(true)` approved, `Some(false)` declined.
+    pub approved: Option<bool>,
+    pub expires_at: i64,
+    /// Seconds a poll must wait after the last; `slow_down` raises it by 5.
+    pub interval: i64,
+    pub last_poll: Option<i64>,
+}
+
+/// How long the fake's device codes last, and its polling interval.
+pub const DEVICE_CODE_LIFETIME: i64 = 600;
+pub const DEVICE_POLL_INTERVAL: i64 = 5;
+
 /// The fake. Share it with `Arc` and pass it as the clients' transport.
 #[derive(Default)]
 pub struct FakeMeros {
@@ -318,6 +344,26 @@ impl FakeMeros {
             .append_pair("code", &code)
             .append_pair("state", &q["state"]);
         back.to_string()
+    }
+
+    /// The person approves the device sign-in showing `user_code`.
+    pub fn approve_device(&self, user_code: &str) {
+        self.decide_device(user_code, true);
+    }
+
+    /// The person declines the device sign-in showing `user_code`.
+    pub fn deny_device(&self, user_code: &str) {
+        self.decide_device(user_code, false);
+    }
+
+    fn decide_device(&self, user_code: &str, approved: bool) {
+        let mut st = self.state();
+        let d = st
+            .device_sign_ins
+            .values_mut()
+            .find(|d| d.user_code == user_code)
+            .expect("a device sign-in with that code");
+        d.approved = Some(approved);
     }
 
     /// Support answers a ticket: it becomes `pending` (answered).
@@ -373,7 +419,63 @@ impl FakeMeros {
             .unwrap_or_default();
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
         let query: HashMap<String, String> = u.query_pairs().into_owned().collect();
+        let issuer = u.origin().ascii_serialization();
         match segs.as_slice() {
+            [
+                ".well-known",
+                "openid-configuration" | "oauth-authorization-server",
+            ] if st.discovery => {
+                let mut d = json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/oauth/authorize"),
+                    "token_endpoint": format!("{issuer}/oauth/token"),
+                    "userinfo_endpoint": format!("{issuer}/oauth/userinfo"),
+                    "revocation_endpoint": format!("{issuer}/oauth/revoke"),
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                });
+                if st.device_grant {
+                    d["device_authorization_endpoint"] =
+                        json!(format!("{issuer}/oauth/device/code"));
+                    d["grant_types_supported"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("urn:ietf:params:oauth:grant-type:device_code"));
+                }
+                reply(200, d)
+            }
+            [".well-known", ..] => HttpResponse::new(404, Vec::new()),
+            ["oauth", "device", "code"] if st.device_grant => {
+                let f: HashMap<String, String> = r.form_fields().into_iter().collect();
+                if f.get("client_id").is_none_or(|c| c.is_empty()) {
+                    return err(400, "invalid_client");
+                }
+                let n = st.next();
+                let device_code = format!("dc{n}");
+                let user_code = format!("WDJB-{n:04}");
+                let clock = st.clock;
+                st.device_sign_ins.insert(
+                    device_code.clone(),
+                    FakeDeviceSignIn {
+                        user_code: user_code.clone(),
+                        scope: f.get("scope").cloned().unwrap_or_default(),
+                        approved: None,
+                        expires_at: clock + DEVICE_CODE_LIFETIME,
+                        interval: DEVICE_POLL_INTERVAL,
+                        last_poll: None,
+                    },
+                );
+                reply(
+                    200,
+                    json!({
+                        "device_code": device_code,
+                        "user_code": user_code,
+                        "verification_uri": format!("{issuer}/link"),
+                        "verification_uri_complete": format!("{issuer}/link?user_code={user_code}"),
+                        "expires_in": DEVICE_CODE_LIFETIME,
+                        "interval": DEVICE_POLL_INTERVAL,
+                    }),
+                )
+            }
             ["oauth", "token"] => oauth_token(&mut st, &r),
             ["oauth", "revoke"] => {
                 st.revoke_session();
@@ -437,6 +539,35 @@ fn oauth_token(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
             }
             let t = st.tokens();
             reply(200, t)
+        }
+        Some("urn:ietf:params:oauth:grant-type:device_code") => {
+            let code = f.get("device_code").cloned().unwrap_or_default();
+            let clock = st.clock;
+            let Some(d) = st.device_sign_ins.get_mut(&code) else {
+                return err(400, "invalid_grant");
+            };
+            if clock >= d.expires_at {
+                st.device_sign_ins.remove(&code);
+                return err(400, "expired_token");
+            }
+            let too_soon = d.last_poll.is_some_and(|t| clock - t < d.interval);
+            d.last_poll = Some(clock);
+            match d.approved {
+                Some(true) => {
+                    st.device_sign_ins.remove(&code);
+                    let t = st.tokens();
+                    reply(200, t)
+                }
+                Some(false) => {
+                    st.device_sign_ins.remove(&code);
+                    err(400, "access_denied")
+                }
+                None if too_soon => {
+                    d.interval += 5;
+                    err(400, "slow_down")
+                }
+                None => err(400, "authorization_pending"),
+            }
         }
         _ => err(400, "unsupported_grant_type"),
     }

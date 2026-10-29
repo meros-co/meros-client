@@ -193,3 +193,138 @@ async fn user_changes_are_reported_on_sign_in_sign_out_and_a_refused_refresh() {
     a.sign_out().await; // already signed out: no second report
     assert_eq!(*seen.lock().unwrap(), [Some("u1".to_string()), None]);
 }
+
+#[tokio::test]
+async fn a_device_signs_in_with_a_code_approved_elsewhere() {
+    let fake = FakeMeros::new();
+    let store = Arc::new(MemoryTokenStore::default());
+    let config = auth(&fake).config.clone();
+    let a = MerosAuth::new(config.clone(), fake.clone(), store.clone());
+    let mut d = a.begin_device_sign_in().await.unwrap();
+    assert_eq!(d.verification_uri, format!("{ISSUER}/link"));
+    assert_eq!(
+        d.verification_uri_complete.as_deref(),
+        Some(format!("{ISSUER}/link?user_code={}", d.user_code).as_str())
+    );
+    assert_eq!(d.interval, 5);
+    let start = &fake.requests_to("/oauth/device/code")[0];
+    let fields: std::collections::HashMap<_, _> = start.form_fields().into_iter().collect();
+    assert_eq!(
+        (fields["client_id"].as_str(), fields["scope"].as_str()),
+        ("client-1", "openid offline_access")
+    );
+
+    // Not approved yet.
+    assert_eq!(a.poll_device_sign_in(&mut d).await.unwrap(), None);
+    assert!(!a.signed_in());
+    fake.state().clock += 5;
+    fake.approve_device(&d.user_code);
+    let user = a.poll_device_sign_in(&mut d).await.unwrap().unwrap();
+    assert_eq!(user.id, "u1");
+    assert!(a.signed_in());
+    let token = &fake.requests_to("/oauth/token")[1];
+    let fields: std::collections::HashMap<_, _> = token.form_fields().into_iter().collect();
+    assert_eq!(
+        fields["grant_type"],
+        "urn:ietf:params:oauth:grant-type:device_code"
+    );
+
+    // The refresh token is stored and rotates as for any sign-in.
+    let first = a.access_token(false).await.unwrap();
+    let second = a.access_token(true).await.unwrap();
+    assert_ne!(first, second);
+    let again = MerosAuth::new(config, fake.clone(), store);
+    again.load().await;
+    assert_eq!(again.user().unwrap().id, "u1");
+    assert!(again.access_token(true).await.is_ok());
+    // Each client read discovery once and kept it.
+    assert_eq!(
+        fake.requests_to("/.well-known/openid-configuration").len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn polling_too_fast_slows_the_device_down() {
+    let fake = FakeMeros::new();
+    let a = auth(&fake);
+    let mut d = a.begin_device_sign_in().await.unwrap();
+    assert_eq!(a.poll_device_sign_in(&mut d).await.unwrap(), None);
+    assert_eq!(a.poll_device_sign_in(&mut d).await.unwrap(), None);
+    assert_eq!(d.interval, 10);
+    fake.state().clock += 10;
+    assert_eq!(a.poll_device_sign_in(&mut d).await.unwrap(), None);
+    assert_eq!(d.interval, 10);
+}
+
+#[tokio::test]
+async fn a_declined_or_expired_device_sign_in_fails() {
+    let fake = FakeMeros::new();
+    let a = auth(&fake);
+    let mut d = a.begin_device_sign_in().await.unwrap();
+    fake.deny_device(&d.user_code);
+    let e = a.poll_device_sign_in(&mut d).await.unwrap_err();
+    assert_eq!(e.code, "access_denied");
+    assert!(!a.signed_in());
+
+    let mut d = a.begin_device_sign_in().await.unwrap();
+    fake.state().clock += 600;
+    let e = a.poll_device_sign_in(&mut d).await.unwrap_err();
+    assert_eq!(e.code, "expired_token");
+
+    // Past its own expiry the client stops asking.
+    let clock = Arc::new(AtomicI64::new(1_000));
+    let c = clock.clone();
+    let b = MerosAuth::new(
+        auth(&fake).config.clone(),
+        fake.clone(),
+        Arc::new(MemoryTokenStore::default()),
+    )
+    .with_clock(move || c.load(Ordering::SeqCst));
+    let mut d = b.begin_device_sign_in().await.unwrap();
+    assert_eq!(d.expires_at, 1_600);
+    clock.store(1_600, Ordering::SeqCst);
+    let asked = fake.requests_to("/oauth/token").len();
+    let e = b.poll_device_sign_in(&mut d).await.unwrap_err();
+    assert_eq!(e.code, "expired_token");
+    assert_eq!(fake.requests_to("/oauth/token").len(), asked);
+}
+
+#[tokio::test]
+async fn an_issuer_without_the_device_grant_says_so() {
+    let fake = FakeMeros::new();
+    fake.state().device_grant = false;
+    let e = auth(&fake).begin_device_sign_in().await.unwrap_err();
+    assert_eq!(e.code, "device_grant_unsupported");
+}
+
+#[tokio::test]
+async fn endpoints_come_from_discovery() {
+    let fake = FakeMeros::new();
+    let a = signed_in(&fake).await;
+    a.access_token(true).await.unwrap();
+    a.sign_out().await;
+    assert_eq!(
+        fake.requests_to("/.well-known/openid-configuration").len(),
+        1
+    );
+    assert_eq!(fake.requests_to("/oauth/token").len(), 2);
+    assert_eq!(fake.requests_to("/oauth/userinfo").len(), 1);
+    assert_eq!(fake.requests_to("/oauth/revoke").len(), 1);
+}
+
+#[tokio::test]
+async fn an_issuer_without_discovery_signs_in_at_its_standard_paths() {
+    let fake = FakeMeros::new();
+    fake.state().discovery = false;
+    let a = signed_in(&fake).await;
+    assert!(a.access_token(true).await.is_ok());
+    // Asked once, then remembered.
+    assert_eq!(
+        fake.requests_to("/.well-known/openid-configuration").len(),
+        1
+    );
+    // The device grant needs discovery.
+    let e = a.begin_device_sign_in().await.unwrap_err();
+    assert_eq!(e.code, "discovery");
+}
