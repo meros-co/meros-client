@@ -100,6 +100,39 @@ impl MerosFile {
     }
 }
 
+/// A document body as Meros hashes it: object keys sorted recursively,
+/// array order kept, no whitespace, `/` and non-ASCII unescaped.
+pub fn canonical_json(value: &Value) -> String {
+    fn sorted(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                let mut out = Map::new();
+                for k in keys {
+                    out.insert(k.clone(), sorted(&m[k]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    // Keys are inserted in order, so the output follows it whether or not
+    // serde_json keeps insertion order.
+    serde_json::to_string(&sorted(value)).unwrap_or_default()
+}
+
+/// A document's `content_hash`: the sha256 (lowercase hex) of its
+/// [`canonical_json`]. Equal hashes mean an identical copy, which is not a
+/// conflict worth asking anyone about.
+pub fn content_hash(body: &Value) -> String {
+    Sha256::digest(canonical_json(body).as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// The sha256 (lowercase hex) that names `bytes` in file storage.
 pub fn file_hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -518,6 +551,20 @@ impl MerosCloud {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// The whole entitlements answer for `product`: `{product, account_id,
+    /// features: {flag: true, tier}, entitlements: [{sku, kind, status,
+    /// expires_at}]}`.
+    pub async fn entitlements(&self, product: &str, account: Option<&str>) -> Result<Value, Error> {
+        let mut query = vec![("product", product)];
+        if let Some(a) = account {
+            query.push(("account_id", a));
+        }
+        Ok(self
+            .send("GET", self.url("/v1/entitlements", &query), None, None)
+            .await?
+            .value())
     }
 
     /// The account's tier for `product` (`free` or `pro`).

@@ -28,6 +28,10 @@ pub const ENVELOPE: u32 = 1;
 pub const BATCH: usize = 500;
 /// How many events wait for collectors before the oldest are dropped.
 const PENDING_CAP: usize = 10_000;
+/// The envelope's limits: an event over 64 KiB is dropped (and counted as
+/// lost); attributes over 16 KiB keep as many keys as fit.
+pub const MAX_EVENT_BYTES: usize = 64 * 1024;
+pub const MAX_ATTRS_BYTES: usize = 16 * 1024;
 /// The local log's size before it rolls over to its previous generation.
 const LOG_CAP: u64 = 10 * 1024 * 1024;
 
@@ -242,7 +246,8 @@ impl Emitter {
 
     /// Records an event: to the local log at once, and queued for the
     /// collectors. Never blocks on the network, never fails.
-    pub fn emit(&self, event: Event) {
+    pub fn emit(&self, mut event: Event) {
+        event.attrs = fit_attrs(event.attrs);
         let mut inner = self.inner.lock().unwrap();
         inner.seq += 1;
         let envelope = Envelope {
@@ -258,10 +263,15 @@ impl Emitter {
             attrs: event.attrs,
             trace: event.trace,
         };
-        if let Ok(mut line) = serde_json::to_string(&envelope) {
-            line.push('\n');
-            inner.write_log(line.as_bytes());
+        let Ok(mut line) = serde_json::to_string(&envelope) else {
+            return;
+        };
+        if line.len() > MAX_EVENT_BYTES {
+            inner.dropped += 1;
+            return;
         }
+        line.push('\n');
+        inner.write_log(line.as_bytes());
         if !inner.collectors.is_empty() {
             if inner.pending.len() >= PENDING_CAP {
                 inner.pending.pop_front();
@@ -503,6 +513,22 @@ fn last_seq(dir: &Path) -> u64 {
                 .last()
         })
         .unwrap_or(0)
+}
+
+/// `attrs` cut to [`MAX_ATTRS_BYTES`], keeping keys in order while they fit.
+fn fit_attrs(attrs: Map<String, Value>) -> Map<String, Value> {
+    if serde_json::to_vec(&attrs).map_or(0, |v| v.len()) <= MAX_ATTRS_BYTES {
+        return attrs;
+    }
+    let mut out = Map::new();
+    for (k, v) in attrs {
+        out.insert(k.clone(), v);
+        if serde_json::to_vec(&out).map_or(0, |v| v.len()) > MAX_ATTRS_BYTES {
+            out.remove(&k);
+            break;
+        }
+    }
+    out
 }
 
 /// RFC 3339, UTC, to the millisecond, ending in `Z`.

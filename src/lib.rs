@@ -48,12 +48,12 @@ pub mod cli;
 pub mod fake;
 
 pub use auth::{
-    AccessTokenSource, AuthConfig, DeviceSignIn, Discovery, MemoryTokenStore, MerosAuth, MerosUser,
-    Pkce, StaticToken, TokenStore,
+    AccessTokenSource, AuthConfig, DeviceSignIn, Discovery, LoginTokenRequest, MemoryTokenStore,
+    MerosAuth, MerosUser, Pkce, StaticToken, TokenStore,
 };
 pub use cloud::{
     FeedResponse, MerosAccount, MerosCloud, MerosDoc, MerosDocInfo, MerosDocVersion, MerosFeeds,
-    MerosFile, MerosPack, MerosProfile, file_hash, verify_pack,
+    MerosFile, MerosPack, MerosProfile, canonical_json, content_hash, file_hash, verify_pack,
 };
 #[cfg(feature = "entitlement")]
 pub use device::EntitlementDevice;

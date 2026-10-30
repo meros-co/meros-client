@@ -3,7 +3,9 @@
 //! revocation. Mobile apps redirect to their own scheme; desktop apps use a
 //! loopback redirect (RFC 8252, see [`crate::loopback`]). Devices with no
 //! browser sign in with the device authorization grant (RFC 8628): they show
-//! a code and a link, and the person approves it on another device.
+//! a code and a link, and the person approves it on another device. A
+//! service whose user signed in elsewhere redeems the login token minted
+//! there ([`MerosAuth::begin_login_token_sign_in`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -172,6 +174,30 @@ pub struct DeviceSignIn {
 }
 
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const LOGIN_TOKEN_GRANT: &str = "urn:meros:params:oauth:grant-type:sso-ticket";
+
+/// A login-token sign-in waiting for its token: hand `code_challenge`
+/// (S256) and `nonce` to whoever mints the login token, then redeem it with
+/// [`MerosAuth::complete_login_token_sign_in`] and this `request_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginTokenRequest {
+    pub request_id: String,
+    pub code_challenge: String,
+    pub nonce: String,
+    /// When the request is forgotten, unix seconds.
+    pub expires_at: i64,
+}
+
+/// How long a login-token request waits, and how many may wait at once.
+const LOGIN_PENDING_SECS: i64 = 300;
+const LOGIN_PENDING_MAX: usize = 16;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct LoginPending {
+    verifier: String,
+    nonce: String,
+    expires_at: i64,
+}
 
 #[derive(Default)]
 struct Session {
@@ -190,6 +216,7 @@ const REFRESH_KEY: &str = "meros.refresh_token";
 const USER_KEY: &str = "meros.user";
 const PENDING_KEY: &str = "meros.pending";
 const ACCESS_KEY: &str = "meros.access_token";
+const LOGIN_PENDING_KEY: &str = "meros.login_pending";
 
 #[derive(Serialize, Deserialize)]
 struct KeptAccess {
@@ -395,6 +422,171 @@ impl MerosAuth {
                 _ => Err(e),
             },
         }
+    }
+
+    async fn login_pending(&self) -> std::collections::BTreeMap<String, LoginPending> {
+        let now = (self.now)();
+        let mut all: std::collections::BTreeMap<String, LoginPending> = self
+            .store
+            .read(LOGIN_PENDING_KEY)
+            .await
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        all.retain(|_, p| p.expires_at > now);
+        all
+    }
+
+    async fn keep_login_pending(&self, all: &std::collections::BTreeMap<String, LoginPending>) {
+        let value = if all.is_empty() {
+            None
+        } else {
+            serde_json::to_string(all).ok()
+        };
+        self.store.write(LOGIN_PENDING_KEY, value).await;
+    }
+
+    /// Starts redeeming a login token minted for this client elsewhere (a
+    /// user who signed in on another product's console). Up to 16 requests
+    /// wait at once, each for five minutes; the oldest goes first.
+    pub async fn begin_login_token_sign_in(&self) -> LoginTokenRequest {
+        let pkce = Pkce::generate();
+        let nonce = random_unreserved(22);
+        let request_id = random_unreserved(22);
+        let expires_at = (self.now)() + LOGIN_PENDING_SECS;
+        let mut all = self.login_pending().await;
+        while all.len() >= LOGIN_PENDING_MAX {
+            let oldest = all
+                .iter()
+                .min_by_key(|(_, p)| p.expires_at)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
+            all.remove(&oldest);
+        }
+        all.insert(
+            request_id.clone(),
+            LoginPending {
+                verifier: pkce.verifier.clone(),
+                nonce: nonce.clone(),
+                expires_at,
+            },
+        );
+        self.keep_login_pending(&all).await;
+        LoginTokenRequest {
+            request_id,
+            code_challenge: pkce.challenge,
+            nonce,
+            expires_at,
+        }
+    }
+
+    /// Redeems `login_token` for request `request_id` as this client, with
+    /// the configured scopes. The id_token must be for this client, carry
+    /// the request's nonce and a subject, be unexpired and come from this
+    /// issuer, and a refresh token must come with it; otherwise the tokens
+    /// are revoked and the sign-in fails with `invalid_response`. A different
+    /// user already signed in here is signed out on the service first; the
+    /// result says whether that happened. Fails with `unknown_request` for a
+    /// request not begun here or expired, and the service's `invalid_grant`
+    /// for a token it won't take. Offline, the request is kept for a retry.
+    pub async fn complete_login_token_sign_in(
+        &self,
+        request_id: &str,
+        login_token: &str,
+    ) -> Result<(MerosUser, bool), Error> {
+        let mut all = self.login_pending().await;
+        let Some(pending) = all.get(request_id).cloned() else {
+            return Err(Error::new(
+                None,
+                "unknown_request",
+                "This sign-in was not begun here, or it expired. Begin it again.",
+            ));
+        };
+        let scope = self.config.scopes.join(" ");
+        let result = self
+            .token_response(&[
+                ("grant_type", LOGIN_TOKEN_GRANT),
+                ("login_token", login_token),
+                ("client_id", &self.config.client_id),
+                ("code_verifier", &pending.verifier),
+                ("scope", &scope),
+            ])
+            .await;
+        if !matches!(&result, Err(e) if e.offline()) {
+            all.remove(request_id);
+            self.keep_login_pending(&all).await;
+        }
+        let t = result?;
+        let issuer = self.discover().await.ok().map(|d| d.issuer);
+        let claims = t
+            .id_token
+            .as_deref()
+            .and_then(jwt_claims)
+            .unwrap_or(serde_json::Value::Null);
+        let problem = id_token_problem(
+            &claims,
+            &self.config.client_id,
+            &pending.nonce,
+            issuer.as_deref(),
+            (self.now)(),
+        )
+        .or_else(|| {
+            t.refresh_token
+                .is_none()
+                .then_some("no refresh token was returned")
+        });
+        if let Some(why) = problem {
+            self.revoke(&t.access_token).await;
+            return Err(Error::new(
+                None,
+                "invalid_response",
+                format!("The sign-in could not be accepted: {why}."),
+            ));
+        }
+        let text = |k: &str| claims[k].as_str().unwrap_or_default().to_string();
+        let user = MerosUser {
+            id: text("sub"),
+            name: text("name"),
+            email: text("email"),
+        };
+        self.load().await;
+        let previous = self.user();
+        let replaced = previous.as_ref().is_some_and(|p| p.id != user.id);
+        if replaced {
+            let access = self.session.lock().unwrap().access.clone();
+            let token = match access {
+                Some(a) => Some(a),
+                None => self.store.read(REFRESH_KEY).await,
+            };
+            if let Some(token) = token {
+                self.revoke(&token).await;
+            }
+        }
+        self.keep(t).await;
+        self.store
+            .write(USER_KEY, serde_json::to_string(&user).ok())
+            .await;
+        {
+            let mut s = self.session.lock().unwrap();
+            s.user = Some(user.clone());
+            s.loaded = true;
+        }
+        self.user_changed(Some(user.clone()));
+        Ok((user, replaced))
+    }
+
+    /// Revokes `token` (RFC 7009) with this client's id; Meros revokes
+    /// nothing without it. Errors are ignored: revocation is best effort.
+    async fn revoke(&self, token: &str) {
+        let revoke = self
+            .endpoint_for(|d| d.revocation_endpoint.clone(), "/oauth/revoke")
+            .await;
+        let _ = self
+            .transport
+            .send(
+                HttpRequest::new("POST", revoke)
+                    .form(&[("token", token), ("client_id", &self.config.client_id)]),
+            )
+            .await;
     }
 
     /// Reads the stored session. The other calls do it on first use; call it
@@ -620,6 +812,11 @@ impl MerosAuth {
     }
 
     async fn token(&self, form: &[(&str, &str)]) -> Result<String, Error> {
+        let t = self.token_response(form).await?;
+        Ok(self.keep(t).await)
+    }
+
+    async fn token_response(&self, form: &[(&str, &str)]) -> Result<Tokens, Error> {
         let endpoint = self
             .endpoint_for(|d| Some(d.token_endpoint.clone()), "/oauth/token")
             .await;
@@ -637,13 +834,12 @@ impl MerosAuth {
             }
             return Err(e);
         }
-        #[derive(Deserialize)]
-        struct Tokens {
-            access_token: String,
-            expires_in: Option<i64>,
-            refresh_token: Option<String>,
-        }
-        let t: Tokens = r.parse()?;
+        r.parse()
+    }
+
+    /// Stores a token response: the rotated refresh token first, then the
+    /// access token.
+    async fn keep(&self, t: Tokens) -> String {
         if let Some(refresh) = t.refresh_token {
             self.store.write(REFRESH_KEY, Some(refresh)).await;
         }
@@ -661,7 +857,7 @@ impl MerosAuth {
         s.access = Some(t.access_token.clone());
         s.expires = expires;
         s.generation += 1;
-        Ok(t.access_token)
+        t.access_token
     }
 
     /// Signs out here and revokes the session on the issuer. Offline, the
@@ -673,16 +869,7 @@ impl MerosAuth {
             None => self.store.read(REFRESH_KEY).await,
         };
         if let Some(token) = token {
-            let revoke = self
-                .endpoint_for(|d| d.revocation_endpoint.clone(), "/oauth/revoke")
-                .await;
-            let _ = self
-                .transport
-                .send(
-                    HttpRequest::new("POST", revoke)
-                        .form(&[("token", &token), ("client_id", &self.config.client_id)]),
-                )
-                .await;
+            self.revoke(&token).await;
         }
         self.clear().await;
     }
@@ -708,6 +895,57 @@ impl AccessTokenSource for MerosAuth {
     fn access_token(&self, force: bool) -> BoxFuture<'_, Result<String, Error>> {
         Box::pin(MerosAuth::access_token(self, force))
     }
+}
+
+#[derive(Deserialize)]
+struct Tokens {
+    access_token: String,
+    expires_in: Option<i64>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+}
+
+/// The claims of a JWT, unverified: an id_token taken straight from the
+/// token endpoint over TLS needs no signature check (OIDC Core 3.1.3.7).
+fn jwt_claims(token: &str) -> Option<serde_json::Value> {
+    let payload = token.split('.').nth(1)?;
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()
+}
+
+/// Why an id_token can't be accepted, if it can't.
+fn id_token_problem(
+    claims: &serde_json::Value,
+    client_id: &str,
+    nonce: &str,
+    issuer: Option<&str>,
+    now: i64,
+) -> Option<&'static str> {
+    if !claims.is_object() {
+        return Some("no readable id_token");
+    }
+    let aud_ok = match &claims["aud"] {
+        serde_json::Value::String(a) => a == client_id,
+        serde_json::Value::Array(a) => a.iter().any(|x| x == client_id),
+        _ => false,
+    };
+    if !aud_ok {
+        return Some("the id_token is for a different client");
+    }
+    if claims["sub"].as_str().is_none_or(|s| s.trim().is_empty()) {
+        return Some("the id_token has no subject");
+    }
+    if claims["nonce"].as_str() != Some(nonce) {
+        return Some("the id_token belongs to another sign-in (nonce)");
+    }
+    if claims["exp"].as_i64().is_some_and(|exp| exp < now - 60) {
+        return Some("the id_token has expired");
+    }
+    if let (Some(want), Some(got)) = (issuer, claims["iss"].as_str())
+        && want != got
+    {
+        return Some("the id_token is from a different issuer");
+    }
+    None
 }
 
 fn no_discovery(status: Option<u16>) -> Error {

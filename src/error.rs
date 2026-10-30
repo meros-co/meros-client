@@ -24,6 +24,9 @@ pub struct Error {
     pub retry_after: Option<u64>,
     /// The current version on a 409 `version_conflict`.
     pub head_version: Option<i64>,
+    /// The head's `content_hash` on a 409, to tell an identical copy
+    /// (see [`crate::content_hash`]) from a real conflict.
+    pub head_content_hash: Option<Box<str>>,
     /// The most a batch may hold, on 413 `batch_too_large`.
     pub max: Option<usize>,
 }
@@ -36,6 +39,7 @@ impl Error {
             message: message.into(),
             retry_after: None,
             head_version: None,
+            head_content_hash: None,
             max: None,
         }
     }
@@ -69,6 +73,10 @@ impl Error {
                 .header_value("retry-after")
                 .and_then(|v| v.trim().parse().ok()),
             head_version: body.pointer("/head/version").and_then(|v| v.as_i64()),
+            head_content_hash: body
+                .pointer("/head/content_hash")
+                .and_then(|v| v.as_str())
+                .map(Box::from),
             max: body.get("max").and_then(|v| v.as_u64()).map(|v| v as usize),
         }
     }

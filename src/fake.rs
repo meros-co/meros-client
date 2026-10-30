@@ -190,9 +190,18 @@ pub struct FakeState {
     pub inventory: BTreeMap<String, Vec<Value>>,
     /// Services the user's login tokens may be minted for.
     pub sso_audiences: BTreeSet<String>,
+    /// The subject a redeemed login token signs in.
+    pub sso_sub: String,
+    /// Minted login tokens: token → (S256 challenge, nonce, redeeming client).
+    pub login_tokens: HashMap<String, (String, String, String)>,
+    /// When the product's entitlement runs out (RFC 3339), listed in the
+    /// entitlements answer; None lists it without an expiry.
+    pub entitlement_expires_at: Option<String>,
     codes: HashMap<String, (String, String)>,
     refresh: HashSet<String>,
     access: HashSet<String>,
+    /// Each access token's refresh token, so a revocation takes both.
+    pairs: HashMap<String, String>,
     sessions: HashMap<String, (String, bool)>,
     pending_files: HashMap<String, usize>,
     bucket: HashMap<String, Vec<u8>>,
@@ -249,9 +258,13 @@ impl Default for FakeState {
             packs: HashMap::new(),
             inventory: BTreeMap::new(),
             sso_audiences: ["service-a".to_string()].into(),
+            sso_sub: "u1".into(),
+            login_tokens: HashMap::new(),
+            entitlement_expires_at: None,
             codes: HashMap::new(),
             refresh: HashSet::new(),
             access: HashSet::new(),
+            pairs: HashMap::new(),
             sessions: HashMap::new(),
             pending_files: HashMap::new(),
             bucket: HashMap::new(),
@@ -273,6 +286,27 @@ impl FakeState {
     /// Makes every live access token stale, as when they expire.
     pub fn expire_access_tokens(&mut self) {
         self.access.clear();
+    }
+
+    /// Revokes one token and its pair (an access token's refresh token, or
+    /// a refresh token's access tokens).
+    pub fn revoke_token(&mut self, token: &str) {
+        if let Some(r) = self.pairs.remove(token) {
+            self.refresh.remove(&r);
+        }
+        self.access.remove(token);
+        if self.refresh.remove(token) {
+            let paired: Vec<String> = self
+                .pairs
+                .iter()
+                .filter(|(_, r)| r.as_str() == token)
+                .map(|(a, _)| a.clone())
+                .collect();
+            for a in paired {
+                self.pairs.remove(&a);
+                self.access.remove(&a);
+            }
+        }
     }
 
     /// Revokes every token, as a sign-out elsewhere or a reuse detection.
@@ -337,6 +371,7 @@ impl FakeState {
         let r = format!("rt{}", self.next());
         self.access.insert(a.clone());
         self.refresh.insert(r.clone());
+        self.pairs.insert(a.clone(), r.clone());
         json!({"access_token": a, "token_type": "Bearer", "expires_in": 3600, "refresh_token": r})
     }
 }
@@ -553,7 +588,7 @@ impl FakeMeros {
                     }),
                 )
             }
-            ["oauth", "token"] => oauth_token(&mut st, &r),
+            ["oauth", "token"] => oauth_token(&mut st, &r, &issuer),
             ["v1", "feeds", product, pack, rest @ ..] if r.method == "GET" => {
                 let signed_in = r
                     .header_value("Authorization")
@@ -561,8 +596,13 @@ impl FakeMeros {
                     .is_some_and(|t| st.access.contains(t));
                 feed(&st, &r, product, pack, rest, &query, signed_in)
             }
+            // RFC 7009: the token and its pair, only with the client's id;
+            // always 200.
             ["oauth", "revoke"] => {
-                st.revoke_session();
+                let f: HashMap<String, String> = r.form_fields().into_iter().collect();
+                if let (Some(t), Some(_)) = (f.get("token"), f.get("client_id")) {
+                    st.revoke_token(t);
+                }
                 HttpResponse::new(200, Vec::new())
             }
             // The device API, at `/app/{product}/v1/…` or a service's own
@@ -601,7 +641,7 @@ impl Transport for FakeMeros {
     }
 }
 
-fn oauth_token(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
+fn oauth_token(st: &mut FakeState, r: &HttpRequest, issuer: &str) -> HttpResponse {
     let f: HashMap<String, String> = r.form_fields().into_iter().collect();
     match f.get("grant_type").map(String::as_str) {
         Some("authorization_code") => {
@@ -622,6 +662,39 @@ fn oauth_token(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
                 return err(400, "invalid_grant");
             }
             let t = st.tokens();
+            reply(200, t)
+        }
+        Some("urn:meros:params:oauth:grant-type:sso-ticket") => {
+            // Single use; the client and PKCE verifier must match the mint.
+            let Some((challenge, nonce, client)) =
+                f.get("login_token").and_then(|t| st.login_tokens.remove(t))
+            else {
+                return err(400, "invalid_grant");
+            };
+            let verifier = f.get("code_verifier").cloned().unwrap_or_default();
+            let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+            if f.get("client_id") != Some(&client)
+                || (!challenge.is_empty() && expected != challenge)
+            {
+                return err(400, "invalid_grant");
+            }
+            let mut t = st.tokens();
+            // id_tokens carry real time, so clients check them on their own
+            // clocks. The signature is a placeholder: clients take an
+            // id_token from the token endpoint without verifying it.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let claims = json!({
+                "iss": issuer, "aud": client, "sub": st.sso_sub, "name": "Pat",
+                "email": "pat@example.com", "nonce": nonce, "iat": now, "exp": now + 3600,
+            });
+            t["id_token"] = json!(format!(
+                "{}.{}.sig",
+                URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+                URL_SAFE_NO_PAD.encode(claims.to_string())
+            ));
             reply(200, t)
         }
         Some("urn:ietf:params:oauth:grant-type:device_code") => {
@@ -1439,6 +1512,14 @@ fn cloud(
                 return err(403, "invalid_target");
             }
             let n = st.next();
+            st.login_tokens.insert(
+                format!("lt{n}"),
+                (
+                    s(&body, "code_challenge"),
+                    s(&body, "nonce"),
+                    format!("{audience}-client"),
+                ),
+            );
             reply(
                 200,
                 json!({
@@ -1479,7 +1560,21 @@ fn cloud(
                     "pro"
                 }),
             );
-            reply(200, json!({"product": query.get("product"), "features": f}))
+            let account = query
+                .get("account_id")
+                .cloned()
+                .unwrap_or_else(|| PERSONAL.into());
+            let entitlements = if st.features.is_empty() {
+                json!([])
+            } else {
+                json!([{"sku": "pro", "kind": "subscription", "status": "active",
+                        "expires_at": st.entitlement_expires_at}])
+            };
+            reply(
+                200,
+                json!({"product": query.get("product"), "account_id": account,
+                       "features": f, "entitlements": entitlements}),
+            )
         }
         (_, ["v1", "profiles", ns]) => profiles(st, &r.method, ns, &body),
         (_, ["v1", "docs", product, collection, rest @ ..]) => {
@@ -1630,7 +1725,10 @@ fn docs(
             {
                 return reply(
                     409,
-                    json!({"error": "version_conflict", "message": "Stale.", "head": {"version": head}}),
+                    json!({"error": "version_conflict", "message": "Stale.", "head": {
+                        "version": head,
+                        "content_hash": st.docs.get(&id).and_then(|l| l.last()).map(|d| crate::cloud::content_hash(&d.body)),
+                    }}),
                 );
             }
             let cap = st.version_cap(product);
