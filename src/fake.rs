@@ -39,6 +39,23 @@ pub fn server_keys() -> Vec<(&'static str, String)> {
     )]
 }
 
+/// The `kid` the fake signs entitlement tokens with when
+/// [`FakeState::signed_tokens`] is on.
+pub const ENTITLEMENT_KID: &str = "fake-entitlement-1";
+const ENTITLEMENT_SEED: [u8; 32] = [7; 32];
+
+/// The fake's entitlement token key table.
+pub fn entitlement_keys() -> Vec<(&'static str, String)> {
+    let key = ed25519_dalek::SigningKey::from_bytes(&ENTITLEMENT_SEED);
+    vec![(
+        ENTITLEMENT_KID,
+        URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+    )]
+}
+
+/// How long the fake's signed entitlement tokens last.
+pub const ENTITLEMENT_LIFETIME: i64 = 30 * 86_400;
+
 /// The personal account's id.
 pub const PERSONAL: &str = "acct-personal";
 
@@ -158,10 +175,21 @@ pub struct FakeState {
     pub clock: i64,
     /// Whether the issuer publishes a discovery document.
     pub discovery: bool,
+    /// Whether entitlement tokens are real signed tokens (see
+    /// [`entitlement_keys`]) rather than opaque strings. A
+    /// [`mint`](Self::mint) set takes precedence.
+    pub signed_tokens: bool,
     /// Whether discovery lists a `device_authorization_endpoint`.
     pub device_grant: bool,
     /// Device sign-ins (RFC 8628) by device code.
     pub device_sign_ins: HashMap<String, FakeDeviceSignIn>,
+    /// Published data packs by `(product, pack)`: each version's payload,
+    /// and whether the pack needs the product's entitlement.
+    pub packs: HashMap<(String, String), (bool, Vec<Value>)>,
+    /// Device inventories by product.
+    pub inventory: BTreeMap<String, Vec<Value>>,
+    /// Services the user's login tokens may be minted for.
+    pub sso_audiences: BTreeSet<String>,
     codes: HashMap<String, (String, String)>,
     refresh: HashSet<String>,
     access: HashSet<String>,
@@ -215,8 +243,12 @@ impl Default for FakeState {
             requests: Vec::new(),
             clock: 1_792_238_400, // 2026-10-17 12:00 UTC
             discovery: true,
+            signed_tokens: false,
             device_grant: true,
             device_sign_ins: HashMap::new(),
+            packs: HashMap::new(),
+            inventory: BTreeMap::new(),
+            sso_audiences: ["service-a".to_string()].into(),
             codes: HashMap::new(),
             refresh: HashSet::new(),
             access: HashSet::new(),
@@ -258,13 +290,46 @@ impl FakeState {
     }
 
     fn mint_token(&mut self, device_id: &str) -> String {
-        match &self.mint {
-            Some(m) => m(device_id),
-            None => {
-                let n = self.next();
-                format!("ent-{device_id}-{n}")
-            }
+        if let Some(m) = &self.mint {
+            return m(device_id);
         }
+        let n = self.next();
+        if !self.signed_tokens {
+            return format!("ent-{device_id}-{n}");
+        }
+        use ed25519_dalek::Signer;
+        let seat = self
+            .seats
+            .iter()
+            .find(|x| x["device_id"] == device_id)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let features: Map<String, Value> = self
+            .features
+            .iter()
+            .map(|f| (f.clone(), json!(true)))
+            .collect();
+        let payload = json!({
+            "v": 1,
+            "kid": ENTITLEMENT_KID,
+            "jti": format!("jti-{n}"),
+            "account_id": seat["account_id"],
+            "account_type": seat["account_type"],
+            "account_name": seat["account_name"],
+            "seat_id": seat["seat_id"],
+            "device_id": device_id,
+            "device_pubkey": self.devices.get(device_id).cloned().unwrap_or_default(),
+            "iat": self.clock,
+            "exp": self.clock + ENTITLEMENT_LIFETIME,
+            "features": features,
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        let sig = ed25519_dalek::SigningKey::from_bytes(&ENTITLEMENT_SEED).sign(&bytes);
+        format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&bytes),
+            URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        )
     }
 
     fn tokens(&mut self) -> Value {
@@ -344,6 +409,18 @@ impl FakeMeros {
             .append_pair("code", &code)
             .append_pair("state", &q["state"]);
         back.to_string()
+    }
+
+    /// Publishes `payload` as the next version of a pack. `entitled` packs
+    /// need a token and one of the product's features.
+    pub fn publish_pack(&self, product: &str, pack: &str, payload: Value, entitled: bool) {
+        let mut st = self.state();
+        let entry = st
+            .packs
+            .entry((product.to_string(), pack.to_string()))
+            .or_insert((entitled, Vec::new()));
+        entry.0 = entitled;
+        entry.1.push(payload);
     }
 
     /// The person approves the device sign-in showing `user_code`.
@@ -477,6 +554,13 @@ impl FakeMeros {
                 )
             }
             ["oauth", "token"] => oauth_token(&mut st, &r),
+            ["v1", "feeds", product, pack, rest @ ..] if r.method == "GET" => {
+                let signed_in = r
+                    .header_value("Authorization")
+                    .map(|t| t.trim_start_matches("Bearer "))
+                    .is_some_and(|t| st.access.contains(t));
+                feed(&st, &r, product, pack, rest, &query, signed_in)
+            }
             ["oauth", "revoke"] => {
                 st.revoke_session();
                 HttpResponse::new(200, Vec::new())
@@ -571,6 +655,76 @@ fn oauth_token(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
         }
         _ => err(400, "unsupported_grant_type"),
     }
+}
+
+/// `GET /v1/feeds/{product}/{pack}[/versions]`: packs signed with the
+/// entitlement key, `ETag` `"v{version}"`.
+fn feed(
+    st: &FakeState,
+    r: &HttpRequest,
+    product: &str,
+    pack: &str,
+    rest: &[&str],
+    query: &HashMap<String, String>,
+    signed_in: bool,
+) -> HttpResponse {
+    use ed25519_dalek::Signer;
+    let Some((entitled, versions)) = st.packs.get(&(product.to_string(), pack.to_string())) else {
+        return err(404, "unknown_pack");
+    };
+    if *entitled {
+        if !signed_in {
+            return reply(401, json!({"message": "Unauthenticated."}));
+        }
+        if !st
+            .features
+            .iter()
+            .any(|f| f.starts_with(&format!("{product}.")))
+        {
+            return err(403, "not_entitled");
+        }
+    }
+    if rest == ["versions"] {
+        let list: Vec<Value> = (1..=versions.len())
+            .map(|v| json!({"version": v, "issued_at": st.time()}))
+            .collect();
+        return reply(
+            200,
+            json!({"product": product, "pack": pack, "versions": list}),
+        );
+    }
+    let version = match query.get("version") {
+        Some(v) => match v.parse::<usize>() {
+            Ok(v) if v >= 1 && v <= versions.len() => v,
+            _ => return err(404, "unknown_version"),
+        },
+        None => versions.len(),
+    };
+    let etag = format!("\"v{version}\"");
+    if r.header_value("If-None-Match") == Some(etag.as_str()) {
+        return HttpResponse::new(304, Vec::new());
+    }
+    let header = json!({
+        "product": product, "pack": pack, "version": version,
+        "kid": ENTITLEMENT_KID, "issued_at": st.time(),
+    });
+    let payload = &versions[version - 1];
+    let signed = format!(
+        "MEROSPACK1.{}.{}",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(payload.to_string())
+    );
+    let sig = ed25519_dalek::SigningKey::from_bytes(&ENTITLEMENT_SEED).sign(signed.as_bytes());
+    let mut response = reply(
+        200,
+        json!({
+            "product": product, "pack": pack, "version": version, "kid": ENTITLEMENT_KID,
+            "issued_at": st.time(), "payload": payload,
+            "signature": URL_SAFE_NO_PAD.encode(sig.to_bytes()), "signed": signed,
+        }),
+    );
+    response.headers.push(("etag".into(), etag));
+    response
 }
 
 fn bucket(st: &mut FakeState, r: &HttpRequest, u: &url::Url) -> HttpResponse {
@@ -1246,6 +1400,56 @@ fn cloud(
             200,
             json!({"sub": "u1", "name": "Pat", "email": "pat@example.com"}),
         ),
+        ("GET", ["v1", "inventory", product]) => {
+            if !st.features.contains(&format!("{product}.inventory")) {
+                return err(403, "not_entitled");
+            }
+            let devices = st.inventory.get(*product).cloned().unwrap_or_default();
+            reply(
+                200,
+                json!({"product": product, "count": devices.len(), "updated_at": st.time(), "devices": devices}),
+            )
+        }
+        ("PUT", ["v1", "inventory", product]) => {
+            if !st.features.contains(&format!("{product}.inventory")) {
+                return err(403, "not_entitled");
+            }
+            let Some(devices) = body.get("devices").and_then(|d| d.as_array()).cloned() else {
+                return err(400, "bad_request");
+            };
+            if let Some(i) = devices
+                .iter()
+                .position(|d| d.get("id").and_then(|v| v.as_str()).is_none())
+            {
+                return reply(
+                    422,
+                    json!({"error": "invalid_inventory", "message": format!("devices[{i}].id is required.")}),
+                );
+            }
+            let count = devices.len();
+            st.inventory.insert(product.to_string(), devices);
+            reply(
+                200,
+                json!({"product": product, "count": count, "updated_at": st.time()}),
+            )
+        }
+        ("POST", ["oauth", "sso", "ticket"]) => {
+            let audience = s(&body, "audience");
+            if !st.sso_audiences.contains(&audience) {
+                return err(403, "invalid_target");
+            }
+            let n = st.next();
+            reply(
+                200,
+                json!({
+                    "login_token": format!("lt{n}"),
+                    "token_type": "urn:meros:params:oauth:token-type:sso-ticket",
+                    "expires_in": 120,
+                    "audience": audience,
+                    "client_id": format!("{audience}-client"),
+                }),
+            )
+        }
         ("GET", ["v1", "accounts"]) => {
             let mut list = vec![
                 json!({"id": PERSONAL, "type": "person", "name": "Pat", "role": "owner", "default": st.team.is_none()}),

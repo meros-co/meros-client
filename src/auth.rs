@@ -189,6 +189,13 @@ type UserHook = Arc<dyn Fn(Option<MerosUser>) + Send + Sync>;
 const REFRESH_KEY: &str = "meros.refresh_token";
 const USER_KEY: &str = "meros.user";
 const PENDING_KEY: &str = "meros.pending";
+const ACCESS_KEY: &str = "meros.access_token";
+
+#[derive(Serialize, Deserialize)]
+struct KeptAccess {
+    token: String,
+    expires: i64,
+}
 
 /// Sign in with Meros. Share one per app (it is `Send + Sync`); refresh
 /// tokens rotate, so two instances must not share one store.
@@ -201,6 +208,7 @@ pub struct MerosAuth {
     refreshing: tokio::sync::Mutex<()>,
     on_user_changed: Option<UserHook>,
     discovery: Mutex<Endpoints>,
+    keep_access: bool,
 }
 
 /// What discovery found: nothing yet, the document, or that the issuer has
@@ -228,6 +236,7 @@ impl MerosAuth {
             refreshing: tokio::sync::Mutex::new(()),
             on_user_changed: None,
             discovery: Mutex::new(Endpoints::Unknown),
+            keep_access: false,
         }
     }
 
@@ -250,6 +259,14 @@ impl MerosAuth {
 
     pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
         self.now = Arc::new(now);
+        self
+    }
+
+    /// Keeps the access token in the store too, so a process that runs
+    /// briefly (a command-line call) reuses it until it runs out instead of
+    /// refreshing on every start.
+    pub fn keep_access_token(mut self) -> Self {
+        self.keep_access = true;
         self
     }
 
@@ -388,6 +405,11 @@ impl MerosAuth {
         }
         let user = self.store.read(USER_KEY).await;
         let refresh = self.store.read(REFRESH_KEY).await;
+        let access = if self.keep_access {
+            self.store.read(ACCESS_KEY).await
+        } else {
+            None
+        };
         let mut s = self.session.lock().unwrap();
         if s.loaded {
             return;
@@ -395,6 +417,10 @@ impl MerosAuth {
         s.loaded = true;
         if refresh.is_some() {
             s.user = user.and_then(|u| serde_json::from_str(&u).ok());
+            if let Some(kept) = access.and_then(|a| serde_json::from_str::<KeptAccess>(&a).ok()) {
+                s.access = Some(kept.token);
+                s.expires = kept.expires;
+            }
         }
     }
 
@@ -621,9 +647,19 @@ impl MerosAuth {
         if let Some(refresh) = t.refresh_token {
             self.store.write(REFRESH_KEY, Some(refresh)).await;
         }
+        let expires = (self.now)() + t.expires_in.unwrap_or(3600);
+        if self.keep_access {
+            let kept = KeptAccess {
+                token: t.access_token.clone(),
+                expires,
+            };
+            self.store
+                .write(ACCESS_KEY, serde_json::to_string(&kept).ok())
+                .await;
+        }
         let mut s = self.session.lock().unwrap();
         s.access = Some(t.access_token.clone());
-        s.expires = (self.now)() + t.expires_in.unwrap_or(3600);
+        s.expires = expires;
         s.generation += 1;
         Ok(t.access_token)
     }
@@ -659,6 +695,9 @@ impl MerosAuth {
         };
         self.store.write(REFRESH_KEY, None).await;
         self.store.write(USER_KEY, None).await;
+        if self.keep_access {
+            self.store.write(ACCESS_KEY, None).await;
+        }
         if had_user {
             self.user_changed(None);
         }

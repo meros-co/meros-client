@@ -1,10 +1,14 @@
 //! The Meros Cloud services (`/v1/…`), authorized as the signed-in user:
-//! profiles, versioned documents (backups), files, accounts and
-//! entitlements. Every request retries once with a fresh token on 401.
+//! profiles, versioned documents (backups), files, accounts, entitlements,
+//! device inventory and login tokens for connected services, plus signed
+//! data-pack feeds (public packs need no sign-in). Every request retries
+//! once with a fresh token on 401.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -531,6 +535,259 @@ impl MerosCloud {
             .unwrap_or("free")
             .to_string())
     }
+
+    // Inventory: a product's device list for the account, replaced whole.
+
+    /// The account's device inventory for `product`:
+    /// `{product, count, updated_at, devices}`.
+    pub async fn inventory(&self, product: &str, account: Option<&str>) -> Result<Value, Error> {
+        let url = self.url(&format!("/v1/inventory/{}", segment(product)), &[]);
+        Ok(self.send("GET", url, None, account).await?.value())
+    }
+
+    /// Replaces the inventory with `devices` (upserted by `id`; devices left
+    /// out are deleted, `[]` clears it). Returns `{product, count,
+    /// updated_at}`. Refusals include `invalid_inventory` (naming the
+    /// field), `inventory_too_large` and `insufficient_scope`.
+    pub async fn put_inventory(
+        &self,
+        product: &str,
+        devices: Vec<Value>,
+        account: Option<&str>,
+    ) -> Result<Value, Error> {
+        let url = self.url(&format!("/v1/inventory/{}", segment(product)), &[]);
+        Ok(self
+            .send("PUT", url, Some(&json!({"devices": devices})), account)
+            .await?
+            .value())
+    }
+
+    /// Mints a single-use login token for a connected service (`audience`)
+    /// from this user's session, so that service can sign the same user in
+    /// as its own client (`POST /oauth/sso/ticket`). `code_challenge` is the
+    /// service's S256 challenge where it uses PKCE; `acr_values` such as
+    /// `urn:meros:acr:mfa` asks for a two-factor sign-in. Returns
+    /// `{login_token, token_type, expires_in, audience, client_id}`.
+    /// Refusals include `invalid_target` and `mfa_required`.
+    pub async fn login_token(
+        &self,
+        audience: &str,
+        code_challenge: Option<&str>,
+        nonce: Option<&str>,
+        acr_values: Option<&str>,
+    ) -> Result<Value, Error> {
+        let mut body = json!({"audience": audience});
+        if let Some(c) = code_challenge {
+            body["code_challenge"] = json!(c);
+            body["code_challenge_method"] = json!("S256");
+        }
+        if let Some(n) = nonce {
+            body["nonce"] = json!(n);
+        }
+        if let Some(a) = acr_values {
+            body["acr_values"] = json!(a);
+        }
+        let url = self.url("/oauth/sso/ticket", &[]);
+        Ok(self.send("POST", url, Some(&body), None).await?.value())
+    }
+}
+
+/// A signed data pack as a feed serves it, before verification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MerosPack {
+    pub product: String,
+    pub pack: String,
+    pub version: i64,
+    pub kid: String,
+    pub issued_at: String,
+    /// `MEROSPACK1.<base64url header>.<base64url payload>`, the signed bytes.
+    pub signed: String,
+    /// base64url Ed25519 signature over `signed`.
+    pub signature: String,
+}
+
+/// What a feed request returned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeedResponse {
+    /// The pack, and its `ETag` for the next request.
+    Pack(MerosPack, Option<String>),
+    /// `304`: the copy matching the `ETag` sent is current.
+    NotModified,
+}
+
+/// Signed data-pack feeds (`/v1/feeds/{product}/{pack}`). Public packs
+/// need no `token`; entitled ones answer `401` without one and
+/// `403 not_entitled` without the product's entitlement. Verify what comes
+/// back with [`verify_pack`] before using it.
+pub struct MerosFeeds {
+    /// The issuer, such as the staging or production meros.co origin.
+    pub base_url: String,
+    transport: Arc<dyn Transport>,
+    token: Option<Arc<dyn AccessTokenSource>>,
+}
+
+impl MerosFeeds {
+    pub fn new(
+        base_url: impl Into<String>,
+        transport: Arc<dyn Transport>,
+        token: Option<Arc<dyn AccessTokenSource>>,
+    ) -> Self {
+        MerosFeeds {
+            base_url: base_url.into(),
+            transport,
+            token,
+        }
+    }
+
+    /// A pack, latest or `version`. Pass the last `etag` to get
+    /// [`FeedResponse::NotModified`] cheaply.
+    pub async fn fetch(
+        &self,
+        product: &str,
+        pack: &str,
+        version: Option<i64>,
+        etag: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<FeedResponse, Error> {
+        let v = version.map(|v| v.to_string());
+        let mut query = Vec::new();
+        if let Some(v) = &v {
+            query.push(("version", v.as_str()));
+        }
+        let url = with_query(
+            &format!(
+                "{}/v1/feeds/{}/{}",
+                self.base_url,
+                segment(product),
+                segment(pack)
+            ),
+            &query,
+        );
+        let r = self.get(&url, etag, account).await?;
+        if r.status == 304 {
+            return Ok(FeedResponse::NotModified);
+        }
+        let j = r.value();
+        let text = |k: &str| {
+            j.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let pack = MerosPack {
+            product: text("product"),
+            pack: text("pack"),
+            version: j.get("version").and_then(|v| v.as_i64()).unwrap_or(0),
+            kid: text("kid"),
+            issued_at: text("issued_at"),
+            signed: text("signed"),
+            signature: text("signature"),
+        };
+        Ok(FeedResponse::Pack(
+            pack,
+            r.header_value("etag").map(str::to_string),
+        ))
+    }
+
+    /// The versions a pack offers, as the service lists them.
+    pub async fn versions(
+        &self,
+        product: &str,
+        pack: &str,
+        account: Option<&str>,
+    ) -> Result<Value, Error> {
+        let url = format!(
+            "{}/v1/feeds/{}/{}/versions",
+            self.base_url,
+            segment(product),
+            segment(pack)
+        );
+        Ok(self.get(&url, None, account).await?.value())
+    }
+
+    async fn get(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<HttpResponse, Error> {
+        let request = |access: Option<String>| {
+            let mut r =
+                HttpRequest::new("GET", url.to_string()).header("Accept", "application/json");
+            if let Some(a) = access {
+                r = r.header("Authorization", format!("Bearer {a}"));
+            }
+            if let Some(e) = etag {
+                r = r.header("If-None-Match", e);
+            }
+            if let Some(a) = account {
+                r = r.header("X-Meros-Account", a);
+            }
+            r
+        };
+        let access = match &self.token {
+            Some(t) => Some(t.access_token(false).await?),
+            None => None,
+        };
+        let mut r = self.transport.send(request(access)).await?;
+        if r.status == 401
+            && let Some(t) = &self.token
+        {
+            r = self
+                .transport
+                .send(request(Some(t.access_token(true).await?)))
+                .await?;
+        }
+        if r.status >= 400 {
+            return Err(Error::from_response(&r));
+        }
+        Ok(r)
+    }
+}
+
+/// Verifies a pack offline against the product's `(kid, base64url public
+/// key)` table: Ed25519 over the exact `signed` bytes, with no
+/// re-serialization. Returns the decoded header (`product`, `pack`,
+/// `version`, `kid`, `issued_at`) and the pack's payload, read from the
+/// signed bytes rather than any convenience copy.
+pub fn verify_pack(
+    keys: &[(&str, &str)],
+    signed: &str,
+    signature: &str,
+) -> Result<(Value, Value), String> {
+    let mut parts = signed.split('.');
+    let (Some("MEROSPACK1"), Some(header), Some(payload), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err("not a MEROSPACK1 pack".into());
+    };
+    let decode = |s: &str| -> Result<Value, String> {
+        let bytes = URL_SAFE_NO_PAD.decode(s).map_err(|_| "not base64url")?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON: {e}"))
+    };
+    let header = decode(header)?;
+    let payload = decode(payload)?;
+    let kid = header["kid"].as_str().unwrap_or_default();
+    let key = keys
+        .iter()
+        .find(|(k, _)| *k == kid)
+        .map(|(_, v)| *v)
+        .ok_or_else(|| format!("unknown signing key: {kid}"))?;
+    let key: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(key)
+        .ok()
+        .and_then(|k| k.try_into().ok())
+        .ok_or("product key must be 32 bytes of base64url")?;
+    let sig = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| "signature not base64url")?;
+    let sig =
+        ed25519_dalek::Signature::from_slice(&sig).map_err(|_| "signature must be 64 bytes")?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key)
+        .map_err(|_| "product key is not a valid Ed25519 point")?
+        .verify_strict(signed.as_bytes(), &sig)
+        .map_err(|_| "signature verification failed")?;
+    Ok((header, payload))
 }
 
 #[cfg(test)]

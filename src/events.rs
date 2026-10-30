@@ -300,6 +300,29 @@ impl Emitter {
         self.inner.lock().unwrap().pending.len()
     }
 
+    /// The events waiting for collectors, oldest first, so a process that
+    /// exits can keep them for [`requeue`](Self::requeue) next time.
+    pub fn pending_events(&self) -> Vec<Envelope> {
+        self.inner.lock().unwrap().pending.iter().cloned().collect()
+    }
+
+    /// Puts events kept from [`pending_events`](Self::pending_events) back
+    /// ahead of anything queued since. They keep their ids, so a collector
+    /// that already took one counts it as a duplicate.
+    pub fn requeue(&self, events: Vec<Envelope>) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.collectors.is_empty() {
+            return;
+        }
+        for e in events.into_iter().rev() {
+            inner.pending.push_front(e);
+        }
+        while inner.pending.len() > PENDING_CAP {
+            inner.pending.pop_front();
+            inner.dropped += 1;
+        }
+    }
+
     /// Delivers what's waiting to every collector, a batch at a time, until
     /// the queue is empty or a collector doesn't take a batch (that batch
     /// stays queued for next time). Inside a 202, rejected and duplicate
