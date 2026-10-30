@@ -767,3 +767,359 @@ async fn inventory_and_login_tokens_for_connected_services() {
         (exit::REFUSED, "invalid_target".into())
     );
 }
+
+#[tokio::test]
+async fn several_identities_each_keep_their_own_session() {
+    let env = Env::new();
+    // The console's own session, and an operator's under another client.
+    env.sign_in().await;
+    let op = json!({"session": "op-7", "client_id": "people-client", "scopes": ["openid", "profile", "email", "offline_access", "profiles:read", "profiles:write"]});
+    let with = |extra: Value| {
+        let mut v = op.clone();
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    let start = env.ok("signin.start", op.clone()).await;
+    let poll = &env.fake.requests_to("/oauth/device/code")[1];
+    let fields: std::collections::HashMap<_, _> = poll.form_fields().into_iter().collect();
+    assert_eq!(fields["client_id"], "people-client");
+    // A second pending grant can be cancelled on its own.
+    env.ok("signin.start", json!({"session": "op-8"})).await;
+    env.ok("signin.cancel", json!({"session": "op-8"})).await;
+    assert_eq!(
+        env.refused("signin.poll", json!({"session": "op-8"})).await,
+        (exit::LOCAL, "no_sign_in".into())
+    );
+
+    env.fake
+        .approve_device(start["user_code"].as_str().unwrap());
+    let done = env.ok("signin.poll", op.clone()).await;
+    assert_eq!(
+        (done["user"]["id"].clone(), done["user"]["email"].clone()),
+        (json!("u1"), json!("pat@example.com"))
+    );
+    let list = env.ok("signin.list", json!({})).await;
+    let handles: Vec<&str> = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["session"].as_str().unwrap())
+        .collect();
+    assert_eq!(handles, ["default", "op-7"]);
+
+    // The profile is read and written as that identity.
+    env.ok(
+        "cloud.profile.put",
+        with(json!({"namespace": "example-app", "keys": {"theme": "dark"}})),
+    )
+    .await;
+    let p = env
+        .ok(
+            "cloud.profile.get",
+            with(json!({"namespace": "example-app"})),
+        )
+        .await;
+    assert_eq!(p["keys"]["theme"], "dark");
+    // Refreshing as the operator uses the operator's client.
+    env.ok("signin.token", with(json!({"force": true}))).await;
+    let refresh = env.fake.requests_to("/oauth/token");
+    let fields: std::collections::HashMap<_, _> =
+        refresh.last().unwrap().form_fields().into_iter().collect();
+    assert_eq!(fields["client_id"], "people-client");
+
+    // Revoking one identity leaves the other, and revokes with its client.
+    env.ok("signin.signout", op.clone()).await;
+    let revoke = env.fake.requests_to("/oauth/revoke");
+    let fields: std::collections::HashMap<_, _> =
+        revoke.last().unwrap().form_fields().into_iter().collect();
+    assert_eq!(fields["client_id"], "people-client");
+    assert_eq!(env.ok("signin.status", op).await["signed_in"], false);
+    assert_eq!(env.ok("signin.status", json!({})).await["signed_in"], true);
+}
+
+#[tokio::test]
+async fn a_login_token_from_elsewhere_signs_in_and_replaces_a_previous_user() {
+    let env = Env::new();
+    env.sign_in().await; // the console, which mints
+    let cu = json!({"session": "cloud-user", "client_id": "service-a-client"});
+    let redeem = |begin: &Value, token: &Value| {
+        let mut v = cu.clone();
+        v["request_id"] = begin["request_id"].clone();
+        v["login_token"] = token["login_token"].clone();
+        v
+    };
+    let mint = |begin: &Value, nonce: &str| json!({"audience": "service-a", "code_challenge": begin["code_challenge"], "nonce": nonce});
+
+    let begin = env.ok("signin.redeem.begin", cu.clone()).await;
+    assert_eq!(begin["code_challenge_method"], "S256");
+    let token = env
+        .ok(
+            "signin.login_token",
+            mint(&begin, begin["nonce"].as_str().unwrap()),
+        )
+        .await;
+    let done = env
+        .ok("signin.redeem.complete", redeem(&begin, &token))
+        .await;
+    assert_eq!(
+        (
+            done["user"]["id"].clone(),
+            done["replaced_previous"].clone()
+        ),
+        (json!("u1"), json!(false))
+    );
+    let grant = env.fake.requests_to("/oauth/token");
+    let fields: std::collections::HashMap<_, _> =
+        grant.last().unwrap().form_fields().into_iter().collect();
+    assert_eq!(
+        fields["grant_type"],
+        "urn:meros:params:oauth:grant-type:sso-ticket"
+    );
+    assert!(fields["code_verifier"].len() >= 43);
+    // A login token works once.
+    assert_eq!(
+        env.refused("signin.redeem.complete", redeem(&begin, &token))
+            .await,
+        (exit::LOCAL, "unknown_request".into())
+    );
+    // The refresh token rotates like any other session's.
+    let mut force = cu.clone();
+    force["force"] = json!(true);
+    env.ok("signin.token", force).await;
+
+    // A different user signing in here replaces the first, who is revoked.
+    env.fake.state().sso_sub = "u2".into();
+    let begin = env.ok("signin.redeem.begin", cu.clone()).await;
+    let token = env
+        .ok(
+            "signin.login_token",
+            mint(&begin, begin["nonce"].as_str().unwrap()),
+        )
+        .await;
+    let revokes = env.fake.requests_to("/oauth/revoke").len();
+    let done = env
+        .ok("signin.redeem.complete", redeem(&begin, &token))
+        .await;
+    assert_eq!(
+        (
+            done["user"]["id"].clone(),
+            done["replaced_previous"].clone()
+        ),
+        (json!("u2"), json!(true))
+    );
+    assert_eq!(env.fake.requests_to("/oauth/revoke").len(), revokes + 1);
+
+    // An id_token for another sign-in (wrong nonce) is refused and revoked.
+    let begin = env.ok("signin.redeem.begin", cu.clone()).await;
+    let token = env
+        .ok("signin.login_token", mint(&begin, "someone-elses-nonce"))
+        .await;
+    let revokes = env.fake.requests_to("/oauth/revoke").len();
+    assert_eq!(
+        env.refused("signin.redeem.complete", redeem(&begin, &token))
+            .await,
+        (exit::REFUSED, "invalid_response".into())
+    );
+    assert_eq!(env.fake.requests_to("/oauth/revoke").len(), revokes + 1);
+    // The previous user stays signed in.
+    let status = env.ok("signin.status", cu).await;
+    assert_eq!(status["user"]["id"], "u2");
+}
+
+#[tokio::test]
+async fn a_key_file_seals_every_secret_and_is_required_to_read_them() {
+    let env = Env::new();
+    let key_file = env.dir.path().join("secret.key");
+    let sealed = json!({"key_file": key_file.to_str().unwrap()});
+    let first = env.ok("device.identity", sealed.clone()).await;
+    let start = env.ok("signin.start", sealed.clone()).await;
+    env.fake
+        .approve_device(start["user_code"].as_str().unwrap());
+    env.ok("signin.poll", sealed.clone()).await;
+    // Nothing secret is readable on disk.
+    let device = std::fs::read_to_string(env.state_file("device.json")).unwrap();
+    assert!(device.contains("\"sealed\"") && !device.contains("seed"));
+    let session = std::fs::read_to_string(env.state_file("sessions/default.json")).unwrap();
+    assert!(!session.contains("refresh_token") && session.contains("\"sealed\""));
+    // With the key, everything works across calls.
+    assert_eq!(
+        env.ok("device.identity", sealed.clone()).await["device_id"],
+        first["device_id"]
+    );
+    assert_eq!(
+        env.ok("signin.status", sealed.clone()).await["signed_in"],
+        true
+    );
+    // Without it the files are refused, never replaced.
+    let (code, err) = env.refused("device.identity", json!({})).await;
+    assert_eq!((code, err.as_str()), (exit::LOCAL, "state_error"));
+    assert_eq!(
+        env.ok("device.identity", sealed).await["device_id"],
+        first["device_id"]
+    );
+    // A key kept inside the state directory protects nothing.
+    let inside = env.state_file("key");
+    let o = env
+        .run(
+            "device.identity",
+            json!({"key_file": inside.to_str().unwrap()}),
+        )
+        .await;
+    assert_eq!(o.exit, exit::USAGE);
+}
+
+#[tokio::test]
+async fn entitlements_report_held_features_through_a_thirty_day_grace() {
+    let env = Env::new();
+    env.fake.state().features.insert("example-app.sync".into());
+    env.sign_in().await;
+    let day = 86_400;
+    let at = |secs_ago: i64| {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - secs_ago;
+        // RFC 3339 from unix seconds, UTC.
+        let days = t.div_euclid(day);
+        let (z, secs) = (days + 719_468, t.rem_euclid(day));
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            secs / 3600,
+            secs % 3600 / 60,
+            secs % 60
+        )
+    };
+    let e = env.ok("cloud.entitlements", json!({})).await;
+    assert_eq!(e["held"], json!(["example-app.sync"]));
+    assert_eq!(
+        (e["in_grace"].clone(), e["lapsed"].clone()),
+        (json!(false), json!(false))
+    );
+    assert_eq!(e["account_id"], PERSONAL);
+
+    env.fake.state().entitlement_expires_at = Some(at(10 * day));
+    let e = env.ok("cloud.entitlements", json!({})).await;
+    assert_eq!(
+        (e["in_grace"].clone(), e["held"].clone()),
+        (json!(true), json!(["example-app.sync"]))
+    );
+
+    env.fake.state().entitlement_expires_at = Some(at(40 * day));
+    let e = env.ok("cloud.entitlements", json!({})).await;
+    assert_eq!(e["lapsed"], true);
+    // Held is the honest answer; the features the service listed stay
+    // visible beside it.
+    assert_eq!(e["held"], json!([]));
+    assert_eq!(e["features"], json!(["example-app.sync"]));
+}
+
+#[tokio::test]
+async fn an_identical_copy_is_already_current_and_nothing_is_written() {
+    let env = Env::new();
+    env.sign_in().await;
+    let doc = |body: Value, base: i64| json!({"collection": "shows", "key": "main", "body": body, "base_version": base});
+    let first = env
+        .ok("cloud.docs.put", doc(json!({"b": 1, "a": [2, 1]}), 0))
+        .await;
+    // The same content in another key order is the same document.
+    let same = env
+        .ok("cloud.docs.put", doc(json!({"a": [2, 1], "b": 1}), 0))
+        .await;
+    assert_eq!(
+        (same["unchanged"].clone(), same["version"].clone()),
+        (json!(true), json!(1))
+    );
+    assert_eq!(same["content_hash"], first["content_hash"]);
+    let got = env
+        .ok(
+            "cloud.docs.get",
+            json!({"collection": "shows", "key": "main"}),
+        )
+        .await;
+    assert_eq!(got["content_hash"], first["content_hash"]);
+    // Different content is a real conflict, with the head's hash to compare.
+    let o = env
+        .run("cloud.docs.put", doc(json!({"a": [1, 2], "b": 1}), 0))
+        .await;
+    assert_eq!(o.output["error"]["code"], "version_conflict");
+    assert_eq!(o.output["error"]["head_version"], 1);
+    assert_eq!(
+        o.output["error"]["head_content_hash"],
+        first["content_hash"]
+    );
+    assert_eq!(
+        meros_client::content_hash(&json!({"b": 1, "a": [2, 1]})),
+        first["content_hash"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn events_keep_to_the_envelope_size_limits() {
+    let env = Env::new();
+    env.sign_in().await;
+    let attrs: serde_json::Map<String, Value> = (0..40)
+        .map(|i| (format!("k{i:02}"), json!("x".repeat(1000))))
+        .collect();
+    env.ok(
+        "events.send",
+        json!({"events": [
+            {"type": "example-app.big.attrs", "attrs": attrs},
+            {"type": "example-app.too.big", "trace": "t".repeat(70 * 1024)},
+        ]}),
+    )
+    .await;
+    let events = env.fake.state().events.clone();
+    let big = events
+        .iter()
+        .find(|e| e["type"] == "example-app.big.attrs")
+        .unwrap();
+    let kept = big["attrs"].as_object().unwrap();
+    assert!(serde_json::to_vec(kept).unwrap().len() <= 16 * 1024);
+    assert!(kept.contains_key("k00") && kept.len() < 40);
+    // The oversized event was dropped, and the loss reported.
+    assert!(!events.iter().any(|e| e["type"] == "example-app.too.big"));
+    env.ok("events.flush", json!({})).await;
+    let events = env.fake.state().events.clone();
+    let lost = events
+        .iter()
+        .find(|e| e["type"] == "example-app.events.dropped")
+        .unwrap();
+    assert_eq!(lost["attrs"]["count"], 1);
+}
+
+#[tokio::test]
+async fn nothing_reaches_a_service_without_an_issuer_given() {
+    // There is no built-in host: without `issuer`, service commands refuse
+    // before sending anything, so nothing can default to production.
+    let env = Env::new();
+    let mut input = env.base();
+    input.as_object_mut().unwrap().remove("issuer");
+    for command in [
+        "signin.start",
+        "server.activate",
+        "cloud.feed",
+        "events.flush",
+    ] {
+        let mut i = input.clone();
+        i["license_key"] = json!("K");
+        i["pack"] = json!("p");
+        let o = cli::run(command, i, env.fake.clone()).await;
+        assert_eq!(o.exit, exit::USAGE, "{command}: {}", o.output);
+    }
+    assert!(env.fake.state().requests.is_empty());
+    for file in ["src/cli.rs", "src/bin/meros-client.rs"] {
+        let text = std::fs::read_to_string(file).unwrap();
+        assert!(!text.contains("meros.co"), "{file} names a Meros host");
+    }
+}

@@ -10,6 +10,11 @@
 //! read. A call holds a lock on that directory, so concurrent calls run one
 //! after another and a rotating refresh token is never used twice.
 //!
+//! Several identities can be signed in at once, each under a `session`
+//! handle the caller picks (its own client id, scopes and rotating refresh
+//! token), and with `key_file` every stored secret is sealed with a key kept
+//! outside the state directory.
+//!
 //! The [`READ_ONLY`] commands change nothing: they create no directory, key
 //! or lock file and take only a shared lock, so a privileged process can ask
 //! about another user's state directory without leaving files there. They
@@ -67,6 +72,10 @@ pub const COMMANDS: &[&str] = &[
     "signin.status",
     "signin.token",
     "signin.signout",
+    "signin.list",
+    "signin.cancel",
+    "signin.redeem.begin",
+    "signin.redeem.complete",
     "signin.login_token",
     "server.activate",
     "server.activate_login",
@@ -117,9 +126,11 @@ pub const READ_ONLY: &[&str] = &[
     "server.verify",
     "license.status",
     "signin.status",
+    "signin.list",
 ];
 
 const LOCAL_CODES: &[&str] = &[
+    "unknown_request",
     "state_error",
     "verify_failed",
     "no_device_identity",
@@ -181,6 +192,9 @@ fn failure(e: Error) -> Outcome {
     if let Some(v) = e.head_version {
         error["head_version"] = json!(v);
     }
+    if let Some(h) = &e.head_content_hash {
+        error["head_content_hash"] = json!(h);
+    }
     Outcome {
         exit,
         output: json!({"ok": false, "error": error}),
@@ -201,13 +215,51 @@ fn state_error(e: impl std::fmt::Display) -> Error {
 struct State {
     dir: PathBuf,
     read_only: bool,
+    /// Seals every file written, when the caller gives a key file.
+    key: Option<chacha20poly1305::Key>,
     _lock: Option<File>,
 }
 
+/// The key in `key_file`: 32 random bytes as hex, made on first use.
+fn load_key(path: &str, dir: &Path, create: bool) -> Result<chacha20poly1305::Key, Error> {
+    let path = PathBuf::from(path);
+    let within = |p: &Path| {
+        let canon = |q: &Path| q.canonicalize().unwrap_or_else(|_| q.to_path_buf());
+        p.parent()
+            .is_some_and(|parent| canon(parent).starts_with(canon(dir)))
+    };
+    if within(&path) {
+        return Err(bad_input(
+            "Keep `key_file` outside the state directory, or it protects nothing.",
+        ));
+    }
+    let parse = |text: &str| -> Option<chacha20poly1305::Key> {
+        let text = text.trim();
+        if text.len() != 64 {
+            return None;
+        }
+        let bytes: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16))
+            .collect::<Result<_, _>>()
+            .ok()?;
+        Some(*chacha20poly1305::Key::from_slice(&bytes))
+    };
+    match fs::read_to_string(&path) {
+        Ok(text) => parse(&text).ok_or_else(|| state_error("key_file is not 64 hex digits")),
+        Err(_) if create => {
+            let bytes: [u8; 32] = rand::random();
+            write_private(&path, hex(&bytes).as_bytes()).map_err(state_error)?;
+            Ok(*chacha20poly1305::Key::from_slice(&bytes))
+        }
+        Err(e) => Err(state_error(format!("key_file: {e}"))),
+    }
+}
+
 impl State {
-    fn open(dir: &str) -> Result<State, Error> {
+    fn open(dir: &str, key_file: Option<&str>) -> Result<State, Error> {
         let dir = PathBuf::from(dir);
         create_private_dir(&dir).map_err(state_error)?;
+        let key = key_file.map(|k| load_key(k, &dir, true)).transpose()?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -218,14 +270,16 @@ impl State {
         Ok(State {
             dir,
             read_only: false,
+            key,
             _lock: Some(lock),
         })
     }
 
     /// Opens without creating anything: a shared lock when a writer has
     /// made the lock file, so a read never sees a half-finished call.
-    fn open_read_only(dir: &str) -> Result<State, Error> {
+    fn open_read_only(dir: &str, key_file: Option<&str>) -> Result<State, Error> {
         let dir = PathBuf::from(dir);
+        let key = key_file.map(|k| load_key(k, &dir, false)).transpose()?;
         let lock = match File::open(dir.join("lock")) {
             Ok(f) => {
                 f.lock_shared().map_err(state_error)?;
@@ -236,6 +290,7 @@ impl State {
         Ok(State {
             dir,
             read_only: true,
+            key,
             _lock: lock,
         })
     }
@@ -244,9 +299,39 @@ impl State {
         self.dir.join(name)
     }
 
+    /// A stored JSON file, unsealed if it was sealed. A sealed file without
+    /// the right key reads as missing.
     fn read_json(&self, name: &str) -> Option<Value> {
         let bytes = fs::read(self.path(name)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let value: Value = serde_json::from_slice(&bytes).ok()?;
+        if value.get("sealed").is_none() {
+            return Some(value);
+        }
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        let key = self.key.as_ref()?;
+        let nonce = URL_SAFE_NO_PAD.decode(value["nonce"].as_str()?).ok()?;
+        let data = URL_SAFE_NO_PAD.decode(value["data"].as_str()?).ok()?;
+        if nonce.len() != 12 {
+            return None;
+        }
+        let plain = chacha20poly1305::ChaCha20Poly1305::new(key)
+            .decrypt(chacha20poly1305::Nonce::from_slice(&nonce), data.as_slice())
+            .ok()?;
+        serde_json::from_slice(&plain).ok()
+    }
+
+    /// Like [`read_json`](Self::read_json), but a file that exists and
+    /// can't be read (sealed without the right key, damaged) is an error
+    /// rather than missing, so it is never replaced by a fresh one.
+    fn read_json_strict(&self, name: &str) -> Result<Option<Value>, Error> {
+        if !self.path(name).exists() {
+            return Ok(None);
+        }
+        self.read_json(name).map(Some).ok_or_else(|| {
+            state_error(format!(
+                "{name} can't be read: it is sealed with another key_file, or damaged"
+            ))
+        })
     }
 
     fn write_json(&self, name: &str, value: &Value) -> Result<(), Error> {
@@ -254,6 +339,25 @@ impl State {
             return Err(state_error("this command only reads the state directory"));
         }
         let bytes = serde_json::to_vec_pretty(value).map_err(state_error)?;
+        let bytes = match &self.key {
+            None => bytes,
+            Some(key) => {
+                use chacha20poly1305::aead::{Aead, KeyInit};
+                let nonce: [u8; 12] = rand::random();
+                let data = chacha20poly1305::ChaCha20Poly1305::new(key)
+                    .encrypt(
+                        chacha20poly1305::Nonce::from_slice(&nonce),
+                        bytes.as_slice(),
+                    )
+                    .map_err(|_| state_error("sealing failed"))?;
+                serde_json::to_vec(&json!({
+                    "sealed": 1,
+                    "nonce": URL_SAFE_NO_PAD.encode(nonce),
+                    "data": URL_SAFE_NO_PAD.encode(data),
+                }))
+                .map_err(state_error)?
+            }
+        };
         write_private(&self.path(name), &bytes).map_err(state_error)
     }
 
@@ -302,24 +406,24 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-/// The sign-in session in `session.json`.
+/// One identity's session in `sessions/{handle}.json`.
 struct FileTokenStore {
-    path: PathBuf,
-    read_only: bool,
+    state: Arc<State>,
+    name: String,
     values: Mutex<HashMap<String, String>>,
 }
 
 impl FileTokenStore {
-    fn open(path: PathBuf, read_only: bool) -> FileTokenStore {
-        let values = fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
+    fn open(state: Arc<State>, name: String) -> Result<FileTokenStore, Error> {
+        let values = state
+            .read_json_strict(&name)?
+            .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
-        FileTokenStore {
-            path,
-            read_only,
+        Ok(FileTokenStore {
+            state,
+            name,
             values: Mutex::new(values),
-        }
+        })
     }
 }
 
@@ -335,10 +439,10 @@ impl TokenStore for FileTokenStore {
             Some(v) => values.insert(key.to_string(), v),
             None => values.remove(key),
         };
-        if !self.read_only
-            && let Ok(bytes) = serde_json::to_vec_pretty(&*values)
+        if !self.state.read_only
+            && let Ok(v) = serde_json::to_value(&*values)
         {
-            let _ = write_private(&self.path, &bytes);
+            let _ = self.state.write_json(&self.name, &v);
         }
         Box::pin(async {})
     }
@@ -368,7 +472,7 @@ impl FileDevice {
         model: String,
         name: Option<String>,
     ) -> Result<FileDevice, Error> {
-        let (id, key) = match state.read_json("device.json") {
+        let (id, key) = match state.read_json_strict("device.json")? {
             Some(d) => {
                 let id = d["id"].as_str().unwrap_or_default().to_string();
                 let seed: [u8; 32] = d["seed"]
@@ -595,9 +699,15 @@ impl Ctx {
         transport: Arc<dyn Transport>,
         read_only: bool,
     ) -> Result<Ctx, Error> {
+        let key_file = input
+            .get("key_file")
+            .and_then(|v| v.as_str())
+            .filter(|k| !k.is_empty());
         let state = match input.get("state_dir").and_then(|v| v.as_str()) {
-            Some(d) if !d.is_empty() && read_only => Some(Arc::new(State::open_read_only(d)?)),
-            Some(d) if !d.is_empty() => Some(Arc::new(State::open(d)?)),
+            Some(d) if !d.is_empty() && read_only => {
+                Some(Arc::new(State::open_read_only(d, key_file)?))
+            }
+            Some(d) if !d.is_empty() => Some(Arc::new(State::open(d, key_file)?)),
             _ => None,
         };
         Ok(Ctx {
@@ -677,8 +787,60 @@ impl Ctx {
         )?))
     }
 
+    /// The identity this call acts as: `session` (a handle the caller
+    /// picks), else the session signed in as `sub`, else `default`.
+    fn session(&self) -> Result<String, Error> {
+        if let Some(h) = self.opt("session") {
+            return Ok(file_safe(&h).replace('.', "_"));
+        }
+        let Some(sub) = self.opt("sub") else {
+            return Ok("default".into());
+        };
+        self.sessions()?
+            .into_iter()
+            .find(|(_, u)| u.as_ref().is_some_and(|u| u.id == sub))
+            .map(|(h, _)| h)
+            .ok_or_else(|| {
+                Error::new(
+                    None,
+                    "no_sign_in",
+                    format!("No session is signed in as {sub}."),
+                )
+            })
+    }
+
+    /// Every stored session and who is signed in to it.
+    fn sessions(&self) -> Result<Vec<(String, Option<MerosUser>)>, Error> {
+        let state = self.state()?;
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(state.path("sessions")) else {
+            return Ok(out);
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(handle) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if handle.contains('.') {
+                continue; // a pending grant, not a session
+            }
+            let user = state.read_json(&format!("sessions/{name}")).and_then(|v| {
+                let s = v.get("meros.user")?.as_str()?.to_string();
+                v.get("meros.refresh_token")?;
+                serde_json::from_str::<MerosUser>(&s).ok()
+            });
+            out.push((handle.to_string(), user));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
     fn auth(&self) -> Result<Arc<MerosAuth>, Error> {
         let state = self.state()?;
+        let handle = self.session()?;
+        if !state.read_only {
+            create_private_dir(&state.path("sessions")).map_err(state_error)?;
+        }
         let scopes = match self.input.get("scopes") {
             Some(Value::Array(a)) => a
                 .iter()
@@ -694,9 +856,9 @@ impl Ctx {
             scopes,
         };
         let store = Arc::new(FileTokenStore::open(
-            state.path("session.json"),
-            state.read_only,
-        ));
+            state.clone(),
+            format!("sessions/{handle}.json"),
+        )?);
         Ok(Arc::new(
             MerosAuth::new(config, self.transport.clone(), store).keep_access_token(),
         ))
@@ -774,12 +936,14 @@ impl Ctx {
 
     async fn signin(&self, op: &str) -> Result<Value, Error> {
         let state = self.state()?;
+        let pending = format!("sessions/{}.signin.json", self.session()?);
+        let pending = pending.as_str();
         match op {
             "start" => {
                 let auth = self.auth()?;
                 let s = auth.begin_device_sign_in().await?;
                 state.write_json(
-                    "signin.json",
+                    pending,
                     &json!({
                         "device_code": s.device_code,
                         "user_code": s.user_code,
@@ -798,7 +962,7 @@ impl Ctx {
                 }))
             }
             "poll" => {
-                let p = state.read_json("signin.json").ok_or_else(|| {
+                let p = state.read_json(pending).ok_or_else(|| {
                     Error::new(None, "no_sign_in", "No sign-in started. Run signin.start.")
                 })?;
                 let text = |k: &str| p[k].as_str().unwrap_or_default().to_string();
@@ -817,16 +981,16 @@ impl Ctx {
                     Ok(None) => {
                         let mut kept = p.clone();
                         kept["interval"] = json!(s.interval);
-                        state.write_json("signin.json", &kept)?;
+                        state.write_json(pending, &kept)?;
                         Ok(json!({"status": "pending", "interval": s.interval}))
                     }
                     Ok(Some(user)) => {
-                        state.remove("signin.json");
+                        state.remove(pending);
                         Ok(json!({"status": "signed_in", "user": user_json(&user)}))
                     }
                     Err(e) => {
                         if e.code == "expired_token" || e.code == "access_denied" {
-                            state.remove("signin.json");
+                            state.remove(pending);
                         }
                         Err(e)
                     }
@@ -848,13 +1012,47 @@ impl Ctx {
             "signout" => {
                 let auth = self.auth()?;
                 auth.sign_out().await;
-                state.remove("signin.json");
+                state.remove(pending);
+                let prefix = format!("{}-", self.session()?);
                 if let Ok(entries) = fs::read_dir(state.path("cache")) {
                     for e in entries.flatten() {
-                        let _ = fs::remove_file(e.path());
+                        if e.file_name().to_string_lossy().starts_with(&prefix) {
+                            let _ = fs::remove_file(e.path());
+                        }
                     }
                 }
                 Ok(json!({}))
+            }
+            "list" => Ok(
+                json!({"sessions": self.sessions()?.into_iter().map(|(h, u)| json!({
+                "session": h,
+                "signed_in": u.is_some(),
+                "user": u.as_ref().map(user_json),
+            })).collect::<Vec<_>>()}),
+            ),
+            "cancel" => {
+                state.remove(pending);
+                Ok(json!({}))
+            }
+            "redeem.begin" => {
+                let r = self.auth()?.begin_login_token_sign_in().await;
+                Ok(json!({
+                    "request_id": r.request_id,
+                    "code_challenge": r.code_challenge,
+                    "code_challenge_method": "S256",
+                    "nonce": r.nonce,
+                    "expires_at": r.expires_at,
+                }))
+            }
+            "redeem.complete" => {
+                let (user, replaced) = self
+                    .auth()?
+                    .complete_login_token_sign_in(
+                        &self.req("request_id")?,
+                        &self.req("login_token")?,
+                    )
+                    .await?;
+                Ok(json!({"user": user_json(&user), "replaced_previous": replaced}))
             }
             "login_token" => {
                 let cloud = self.cloud().await?;
@@ -1082,37 +1280,63 @@ impl Ctx {
                 let product = self.req("product")?;
                 let state = self.state()?;
                 let cache = format!(
-                    "cache/entitlements-{}-{}.json",
+                    "cache/{}-entitlements-{}-{}.json",
+                    self.session()?,
                     file_safe(&product),
                     file_safe(account.unwrap_or("default"))
                 );
-                let fetched = async {
-                    let features = cloud.features(&product, account).await?;
-                    let tier = cloud.tier(&product, account).await?;
-                    Ok::<_, Error>((features, tier))
-                }
-                .await;
-                match fetched {
-                    Ok((features, tier)) => {
+                let (answer, cached) = match cloud.entitlements(&product, account).await {
+                    Ok(raw) => {
+                        let features: Vec<String> = raw["features"]
+                            .as_object()
+                            .map(|f| {
+                                f.iter()
+                                    .filter(|(_, v)| v.as_bool() == Some(true))
+                                    .map(|(k, _)| k.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        // The soonest expiry across the product's entitlements.
+                        let expires_at = raw["entitlements"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|e| e["expires_at"].as_str())
+                            .filter_map(|t| parse_rfc3339(t).map(|u| (u, t.to_string())))
+                            .min()
+                            .map(|(_, t)| t);
                         let answer = json!({
-                            "features": features, "tier": tier, "fetched_at": unix_now(),
+                            "account_id": raw["account_id"],
+                            "features": features,
+                            "tier": raw.pointer("/features/tier").and_then(|t| t.as_str()).unwrap_or("free"),
+                            "expires_at": expires_at,
+                            "fetched_at": unix_now(),
                         });
                         create_private_dir(&state.path("cache")).map_err(state_error)?;
                         state.write_json(&cache, &answer)?;
-                        let mut out = answer;
-                        out["cached"] = json!(false);
-                        Ok(out)
+                        (answer, false)
                     }
-                    // Offline, the last answer stands.
+                    // Offline, the last answer stands, within its grace.
                     Err(e) if e.offline() => match state.read_json(&cache) {
-                        Some(mut answer) => {
-                            answer["cached"] = json!(true);
-                            Ok(answer)
-                        }
-                        None => Err(e),
+                        Some(answer) => (answer, true),
+                        None => return Err(e),
                     },
-                    Err(e) => Err(e),
-                }
+                    Err(e) => return Err(e),
+                };
+                let now = unix_now();
+                let expiry = answer["expires_at"].as_str().and_then(parse_rfc3339);
+                let in_grace = expiry.is_some_and(|x| now > x && now < x + ENTITLEMENT_GRACE_SECS);
+                let lapsed = expiry.is_some_and(|x| now >= x + ENTITLEMENT_GRACE_SECS);
+                let mut out = answer.clone();
+                out["held"] = if lapsed {
+                    json!([])
+                } else {
+                    answer["features"].clone()
+                };
+                out["in_grace"] = json!(in_grace);
+                out["lapsed"] = json!(lapsed);
+                out["cached"] = json!(cached);
+                Ok(out)
             }
             "inventory.get" => cloud.inventory(&self.req("product")?, account).await,
             "inventory.put" => {
@@ -1156,22 +1380,41 @@ impl Ctx {
                         account,
                     )
                     .await?;
-                Ok(
-                    json!({"key": d.key, "version": d.version, "head_version": d.head_version, "body": d.body}),
-                )
+                let hash = crate::content_hash(&Value::Object(d.body.clone()));
+                Ok(json!({
+                    "key": d.key, "version": d.version, "head_version": d.head_version,
+                    "body": d.body, "content_hash": hash,
+                }))
             }
             "docs.put" => {
-                let version = cloud
+                let body = self.object("body")?;
+                let hash = crate::content_hash(&Value::Object(body.clone()));
+                match cloud
                     .put_doc(
                         &self.req("product")?,
                         &self.req("collection")?,
                         &self.req("key")?,
-                        self.object("body")?,
+                        body,
                         self.opt_i64("base_version")?,
                         account,
                     )
-                    .await?;
-                Ok(json!({"version": version}))
+                    .await
+                {
+                    Ok(version) => {
+                        Ok(json!({"version": version, "content_hash": hash, "unchanged": false}))
+                    }
+                    // The head moved, but to exactly this content: already
+                    // current, and nothing for anyone to resolve.
+                    Err(e)
+                        if e.code == "version_conflict"
+                            && e.head_content_hash.as_deref() == Some(hash.as_str()) =>
+                    {
+                        Ok(
+                            json!({"version": e.head_version, "content_hash": hash, "unchanged": true}),
+                        )
+                    }
+                    Err(e) => Err(e),
+                }
             }
             "docs.delete" => {
                 cloud
@@ -1507,6 +1750,41 @@ impl Ctx {
         }
         Ok(out)
     }
+}
+
+/// How long a cached entitlement is honored offline after it expires.
+pub const ENTITLEMENT_GRACE_SECS: i64 = 30 * 86_400;
+
+/// Unix seconds of an RFC 3339 time (`2026-10-30T12:00:00Z`, fractions and
+/// offsets allowed).
+fn parse_rfc3339(t: &str) -> Option<i64> {
+    let b = t.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| t.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (h, mi, s) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    let mut rest = &t[19..];
+    if let Some(r) = rest.strip_prefix('.') {
+        rest = r.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    let offset = match rest {
+        "Z" | "z" | "" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) => {
+            let sign = if o.starts_with('-') { -1 } else { 1 };
+            sign * (o[1..3].parse::<i64>().ok()? * 3600 + o[4..6].parse::<i64>().ok()? * 60)
+        }
+        _ => return None,
+    };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + s - offset)
 }
 
 /// `s` as a file-name part: anything but letters, digits, `.`, `_` and `-`

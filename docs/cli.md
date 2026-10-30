@@ -62,18 +62,21 @@ settings on every call, and add the command's own fields.
 | `device_base_url` | device licensing, device support | The product's device base, if it isn't the service root |
 | `model`, `device_name` | licensing | How the device appears on the service. `model` defaults to the OS and architecture |
 | `account_id` | cloud, server login | A team account; omitted means the user's default |
+| `session` | sign-in, cloud, server login, account support, events | Which identity to act as: a handle the caller picks (letters, digits, `_`, `-`). Default `default` |
+| `sub` | the same | Act as whichever session is signed in as this subject, instead of naming the `session` |
+| `key_file` | all | Seal every stored file with the key in this file (below). Made on first use; must be outside the state directory |
 
 ## The state directory
 
 | File | Holds |
 |---|---|
 | `device.json` | The device id and its Ed25519 key seed. Made on first use; never sent anywhere except as signatures and the public key |
-| `session.json` | The Sign in with Meros session: refresh token, user, and the current access token |
-| `signin.json` | A device sign-in in progress |
+| `sessions/{session}.json` | One identity's Sign in with Meros session: refresh token, user, current access token, and login-token requests waiting to be redeemed |
+| `sessions/{session}.signin.json` | That identity's device sign-in in progress |
 | `server.json` | The Server statement and its feature token |
 | `license.json` | The device entitlement token |
 | `events/` | The local event log, the install's identity, and undelivered events (`outbox.json`) |
-| `cache/` | The last entitlements answer and the latest copy of each pack, for offline use. Cleared at sign-out |
+| `cache/` | The last entitlements answer (per session) and the latest copy of each pack, for offline use. A session's entries are cleared when it signs out |
 | `lock` | Held for the length of each call |
 
 On Unix the directory is `0700` and every file `0600`, owned by the calling
@@ -83,10 +86,43 @@ an explicit ACL). Files are replaced atomically.
 
 Each call holds an exclusive lock on `lock`, so concurrent calls run one
 after another. That matters because refresh tokens rotate, and a refresh
-token used twice ends the session.
+token used twice ends the session: Meros revokes the whole family. The new
+refresh token is stored before the access token is used.
+
+### Sealing with `key_file`
+
+Without `key_file`, secrets are protected by the file permissions above:
+another user on the machine can't read them, but anyone who copies the
+state directory (a backup, a support bundle, a shared drive) carries them
+along.
+
+With `key_file`, every file the helper writes is sealed with
+ChaCha20-Poly1305 under a 32-byte key kept in that file (64 hex digits,
+`0600`, made on first use). That covers the device key, sessions, statements,
+tokens and caches. Keep the key file outside the state directory; the helper
+refuses one inside it.
+- Copying the state directory alone then carries no secret.
+- Tampering is detected: a sealed file that doesn't open is an error
+  (`state_error`), never silently replaced by a new key or session.
+
+This matches the at-rest encryption products already use for stored
+refresh tokens. Like theirs, it doesn't protect against someone who can read
+both the directory and the key file. That would need a passphrase typed at
+start, which unattended devices can't have.
+
+### Several identities
+
+Each `session` handle is one identity, with its own client id and scopes
+(passed on each call), its own rotating refresh token, and its own pending
+device grant. A console can keep its own session and any number of people's
+sessions side by side. Sessions never appear in anything the app exports:
+they live only in the state directory.
+
+The helper never decides who a person is locally: it reports `sub`, `name`
+and `email`. Key people on `sub`, never on email.
 
 **Read-only commands** (`server.status`, `server.verify`, `license.status`,
-`signin.status`) create nothing: no directory, no key, no lock file. They
+`signin.status`, `signin.list`) create nothing: no directory, no key, no lock file. They
 take only a shared lock when the lock file exists, so a privileged process
 (an update installer running as root, say) can ask about a service user's
 state directory without leaving root-owned files there. They verify the
@@ -131,6 +167,46 @@ Call it every `interval` seconds:
 ### `signin.status`
 
 `{"signed_in": false}` or `{"signed_in": true, "user": {...}}`. Read-only.
+
+### `signin.list`
+
+`{"sessions": [{"session", "signed_in", "user"}]}`, every identity in the
+state directory. Read-only.
+
+### `signin.cancel`
+
+Forgets the session's pending device grant.
+
+### `signin.redeem.begin` and `signin.redeem.complete`
+
+Signs a user in from a login token minted elsewhere (see
+`signin.login_token`), as this session's client.
+
+1. `signin.redeem.begin` returns `{request_id, code_challenge,
+   code_challenge_method, nonce, expires_at}`. Pass the challenge and nonce
+   to whoever mints the token. Up to 16 requests wait at once, each for five
+   minutes.
+2. `signin.redeem.complete` takes `request_id` and `login_token`, and
+   returns `{user, replaced_previous}`.
+
+The redeem uses the `urn:meros:params:oauth:grant-type:sso-ticket` grant
+with the PKCE verifier and the configured scopes. The id_token must:
+- be for this client;
+- carry the request's nonce and a subject;
+- be unexpired;
+- come from the issuer;
+- arrive with a refresh token.
+
+If any check fails, the tokens are revoked and the call exits 1 with
+`invalid_response`. A different user already signed in to the session is
+revoked first, and `replaced_previous` is `true`. Other refusals: the
+service's `invalid_grant` (the token was used, expired or for another
+client), and exit 4 `unknown_request` (not begun here, or expired). Offline,
+the request is kept, so the call can be retried.
+
+A refused refresh (`invalid_grant`) ends the session: the identity is
+forgotten rather than retried. Sign-out revokes with the session's client
+id, without which Meros revokes nothing.
 
 ### `signin.token`
 
@@ -236,21 +312,47 @@ team account; omitted means the personal one.
 | Command | Input | Returns |
 |---|---|---|
 | `cloud.accounts` | | `{accounts: [{id, name, team, role, is_default}]}` |
-| `cloud.entitlements` | `product` | `{features: ["product.flag", …], tier, fetched_at, cached}`. Offline, the last answer comes back with `cached: true` and its `fetched_at`; with none, exit 2 |
+| `cloud.entitlements` | `product` | `{account_id, features, tier, expires_at, held, in_grace, lapsed, fetched_at, cached}` (below) |
 | `cloud.inventory.get` | `product` | `{product, count, updated_at, devices}` |
 | `cloud.inventory.put` | `product`, `devices` (the full set; each needs `id`) | `{product, count, updated_at}`. Devices left out are deleted; `[]` clears |
 | `cloud.profile.get` | `namespace` | `{keys, updated}` |
 | `cloud.profile.put` | `namespace`, `keys` (a null value deletes a key) | `{keys, updated}` |
 | `cloud.profile.delete` | `namespace` | `{}` |
 | `cloud.docs.list` | `product`, `collection` | `{docs: [{key, head_version, updated}]}` |
-| `cloud.docs.get` | `product`, `collection`, `key`, `version?` | `{key, version, head_version, body}` |
-| `cloud.docs.put` | `product`, `collection`, `key`, `body`, `base_version?` | `{version}`; exit 1 `version_conflict` with `head_version` when someone saved first |
+| `cloud.docs.get` | `product`, `collection`, `key`, `version?` | `{key, version, head_version, body, content_hash}` |
+| `cloud.docs.put` | `product`, `collection`, `key`, `body`, `base_version?` | `{version, content_hash, unchanged}`. Exit 1 `version_conflict` with `head_version` and `head_content_hash` when someone saved different content first; an identical copy is `unchanged: true` with the head's version, and nothing is written |
 | `cloud.docs.delete` | `product`, `collection`, `key` | `{}` |
 | `cloud.docs.versions` | `product`, `collection`, `key` | `{versions: [{version, created, size_bytes}]}` |
 | `cloud.files.list` | `product`, `collection` | `{files: [{sha256, size, status, created, download_url}]}` |
 | `cloud.files.put` | `product`, `collection`, `content_base64` or `path` | `{file}` |
 | `cloud.files.get` | `product`, `collection`, `sha256`, `path?` | `{sha256, size, content_base64}`, or writes `path` |
 | `cloud.files.delete` | `product`, `collection`, `sha256` | `{}` |
+
+### Entitlements, grace and `held`
+
+- `features` lists what the service says the account has.
+- `expires_at` is the soonest expiry across the product's entitlements (null
+  when none expires).
+- Offline, the last answer comes back with `cached: true` and its
+  `fetched_at`; with none cached, exit 2.
+- A cached answer is honored for 30 days past `expires_at`: `in_grace` is
+  true during those days, and after them `lapsed` is true.
+- `held` is the honest answer to "does the account hold this now": the
+  features, or nothing once lapsed. Gate features on `held`. Whether a
+  missing feature actually withholds anything is the product's decision.
+
+### Documents and `content_hash`
+
+`content_hash` is the sha256 of the body's canonical JSON:
+- object keys sorted recursively, array order kept;
+- no whitespace;
+- `/` and non-ASCII left unescaped.
+
+It is the same value Meros computes, so two machines holding the same
+document agree without asking. The version number decides conflicts; the
+hash only tells an identical copy from a real one. Floating-point numbers
+may render differently across languages, so keep them out of documents that
+rely on this.
 
 ## Signed data packs
 
@@ -313,7 +415,12 @@ Input: `events`, an array of:
 
 - Only `type` is required. `severity` is `debug`, `info` (default),
   `notice`, `warning`, `error` or `critical`.
-- The helper adds the id, time, sequence and source.
+- The helper adds the id (a ULID, so a resent batch is recognized as
+  duplicates), time, sequence and source.
+- Limits follow the envelope: attributes over 16 KiB keep as many keys as
+  fit, an event over 64 KiB is dropped (and reported in a
+  `{product}.events.dropped` event), batches go 500 at a time, and at most
+  10,000 events wait.
 - It delivers at once unless `"flush": false`.
 - Optional: `edition`, `site`, and `collectors`
   (`[{"url": …, "auth": "signin" | "none"}]`; default: the issuer with the
@@ -331,5 +438,7 @@ Delivers what's waiting. Same output.
 ## Testing
 
 The helper's tests run every command against `FakeMeros` (`cargo test
---features cli,fake --test cli`). Point manual runs at a staging issuer,
-never production.
+--features cli,fake --test cli`). There is no built-in host: without
+`issuer`, every service command refuses before sending anything, and a test
+checks that no host is written into the helper. Point manual runs at a
+staging issuer, never production.
