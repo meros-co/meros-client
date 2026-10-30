@@ -10,14 +10,17 @@
 //!   rotating refresh tokens in the app's [`TokenStore`]), with a
 //!   [`loopback`] redirect for desktop and the device authorization grant
 //!   (RFC 8628) for devices with no browser.
-//! - [`MerosCloud`]: profiles, versioned documents, files, accounts and
-//!   entitlements.
+//! - [`MerosCloud`]: profiles, versioned documents, files, accounts,
+//!   entitlements, inventory and login tokens; [`MerosFeeds`] and
+//!   [`verify_pack`] for signed data packs.
 //! - [`SupportApi`], [`SupportInbox`] and [`ReplyTracker`]: support tickets
 //!   and push-token registration.
 //! - [`Emitter`]: the Meros Event Envelope v1, logged locally and delivered
 //!   in batches.
 //! - [`fake::FakeMeros`] (feature `fake`): the services in memory, for app
 //!   tests with no network.
+//! - [`cli`] (feature `cli`): the `meros-client` command-line helper, every
+//!   client above as JSON in and JSON out, for apps not written in Rust.
 //!
 //! Nothing here names a host: the app passes its issuer, base URLs and
 //! client id (see [`Environment`]). Every request goes through a
@@ -38,6 +41,9 @@ pub mod support;
 #[cfg(feature = "loopback")]
 pub mod loopback;
 
+#[cfg(feature = "cli")]
+pub mod cli;
+
 #[cfg(feature = "fake")]
 pub mod fake;
 
@@ -46,8 +52,8 @@ pub use auth::{
     Pkce, StaticToken, TokenStore,
 };
 pub use cloud::{
-    MerosAccount, MerosCloud, MerosDoc, MerosDocInfo, MerosDocVersion, MerosFile, MerosProfile,
-    file_hash,
+    FeedResponse, MerosAccount, MerosCloud, MerosDoc, MerosDocInfo, MerosDocVersion, MerosFeeds,
+    MerosFile, MerosPack, MerosProfile, file_hash, verify_pack,
 };
 #[cfg(feature = "entitlement")]
 pub use device::EntitlementDevice;

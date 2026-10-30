@@ -10,11 +10,12 @@ Flutter apps call it from their Rust core through flutter_rust_bridge.
 | `auth` | Sign in with Meros: authorization code with PKCE (S256), the device authorization grant (RFC 8628), rotating refresh tokens kept in the app's `TokenStore`, and sign-out by revocation. Endpoints come from the issuer's discovery document |
 | `server` | Server licenses: activate an instance with a key or a Meros login (which adopts an unowned key), renew daily with `410` vs `403` told apart, release and move, and verify the perpetual Server statement (`verify_licence`). No offline activation |
 | `loopback` | The desktop loopback redirect (RFC 8252). Feature `loopback` |
-| `cloud` | Meros Cloud: profiles, versioned documents, files (signed-URL upload and checked download), accounts and entitlements |
+| `cloud` | Meros Cloud: profiles, versioned documents, files (signed-URL upload and checked download), accounts, entitlements, device inventory, login tokens for connected services, and signed data-pack feeds (`MerosFeeds`, verified offline with `verify_pack`) |
 | `support` | Support tickets over the device API (`SupportApi`) or as the signed-in user for apps without a device license (`AccountSupportApi`), push-token registration, the unread inbox, a new-reply tracker for platforms without push, and support deep links |
 | `events` | The Meros Event Envelope v1 (`meros-co/meros-event-spec` v0.1.1): a capped local NDJSON log, and batched delivery to collectors. Feature `events-runtime` adds periodic delivery on Tokio |
 | `device` | `EntitlementDevice`: a `LicenseDevice` over a meros-entitlement `Store`, keeping its device id, key and seat. Feature `entitlement` |
 | `fake` | `FakeMeros`: all of the services in memory as a `Transport`, for app tests with no network. Feature `fake` |
+| `cli` | The `meros-client` command-line helper: every client above as JSON in and JSON out, for apps not written in Rust, with the device key and sessions kept in a state directory the caller chooses. Feature `cli`; see [docs/cli.md](docs/cli.md) |
 
 ## Principles
 
@@ -24,7 +25,9 @@ Flutter apps call it from their Rust core through flutter_rust_bridge.
   build. Tests use `FakeMeros`, so they reach no server at all.
 - **Keys stay where they are.** The clients never hold a device key. The app
   implements `DeviceSigner` and `LicenseDevice` over whatever already holds
-  the key, so an existing device keeps its id, key and seat.
+  the key, so an existing device keeps its id, key and seat. The
+  command-line helper is the exception: it holds the key itself, in the
+  caller's state directory.
 - **Storage is the app's.** `TokenStore` (OAuth tokens) and `TicketSeenStore`
   (unread state) are traits. The app backs them with the Keystore, the
   Keychain or its own channel.
