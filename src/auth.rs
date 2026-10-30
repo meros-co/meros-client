@@ -344,6 +344,17 @@ impl MerosAuth {
     /// Starts a device sign-in (RFC 8628) at the issuer's
     /// `device_authorization_endpoint`, asking for the configured scopes.
     pub async fn begin_device_sign_in(&self) -> Result<DeviceSignIn, Error> {
+        self.begin_device_sign_in_with(None).await
+    }
+
+    /// [`begin_device_sign_in`](Self::begin_device_sign_in) with
+    /// `acr_values`, such as `urn:meros:acr:mfa` to require a two-factor
+    /// sign-in (a step-up after `mfa_required`). Completing it on a session
+    /// already signed in as the same user upgrades that session.
+    pub async fn begin_device_sign_in_with(
+        &self,
+        acr_values: Option<&str>,
+    ) -> Result<DeviceSignIn, Error> {
         let d = self.discover().await?;
         let Some(endpoint) = d.device_authorization_endpoint else {
             return Err(Error::new(
@@ -353,12 +364,16 @@ impl MerosAuth {
             ));
         };
         let scope = self.config.scopes.join(" ");
+        let mut form = vec![
+            ("client_id", self.config.client_id.as_str()),
+            ("scope", scope.as_str()),
+        ];
+        if let Some(a) = acr_values.filter(|a| !a.is_empty()) {
+            form.push(("acr_values", a));
+        }
         let r = self
             .transport
-            .send(HttpRequest::new("POST", endpoint).form(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("scope", scope.as_str()),
-            ]))
+            .send(HttpRequest::new("POST", endpoint).form(&form))
             .await?;
         if r.status != 200 {
             return Err(Error::from_response(&r));

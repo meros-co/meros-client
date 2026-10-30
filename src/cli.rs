@@ -118,6 +118,7 @@ pub const COMMANDS: &[&str] = &[
     "support.reply",
     "events.send",
     "events.flush",
+    "events.clear",
 ];
 
 /// Commands that only read the state directory.
@@ -941,10 +942,12 @@ impl Ctx {
         match op {
             "start" => {
                 let auth = self.auth()?;
-                let s = auth.begin_device_sign_in().await?;
+                let acr = self.opt("acr_values");
+                let s = auth.begin_device_sign_in_with(acr.as_deref()).await?;
                 state.write_json(
                     pending,
                     &json!({
+                        "acr_values": acr,
                         "device_code": s.device_code,
                         "user_code": s.user_code,
                         "verification_uri": s.verification_uri,
@@ -986,7 +989,11 @@ impl Ctx {
                     }
                     Ok(Some(user)) => {
                         state.remove(pending);
-                        Ok(json!({"status": "signed_in", "user": user_json(&user)}))
+                        let mut out = json!({"status": "signed_in", "user": user_json(&user)});
+                        if !p["acr_values"].is_null() {
+                            out["acr_values"] = p["acr_values"].clone();
+                        }
+                        Ok(out)
                     }
                     Err(e) => {
                         if e.code == "expired_token" || e.code == "access_denied" {
@@ -1673,6 +1680,18 @@ impl Ctx {
 
     async fn events(&self, op: &str) -> Result<Value, Error> {
         let state = self.state()?;
+        let outbox = state.path("events").join("outbox.json");
+        if op == "clear" {
+            // Drops what's waiting without sending it: nothing leaves.
+            let waiting = fs::read(&outbox)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok())
+                .map_or(0, |v| v.len());
+            if outbox.exists() {
+                write_private(&outbox, b"[]").map_err(state_error)?;
+            }
+            return Ok(json!({"cleared": waiting, "pending": 0}));
+        }
         let collectors = self.collectors().await?;
         let emitter = Emitter::open(
             EmitterConfig {
@@ -1686,7 +1705,6 @@ impl Ctx {
             self.transport.clone(),
         )
         .map_err(state_error)?;
-        let outbox = state.path("events").join("outbox.json");
         let kept: Vec<Envelope> = fs::read(&outbox)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())

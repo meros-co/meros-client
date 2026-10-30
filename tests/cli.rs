@@ -1123,3 +1123,67 @@ async fn nothing_reaches_a_service_without_an_issuer_given() {
         assert!(!text.contains("meros.co"), "{file} names a Meros host");
     }
 }
+
+#[tokio::test]
+async fn a_two_factor_step_up_signs_the_same_session_in_again() {
+    let env = Env::new();
+    env.sign_in().await;
+    let first = env.ok("signin.token", json!({})).await;
+    let mfa = json!({"acr_values": "urn:meros:acr:mfa"});
+    let start = env.ok("signin.start", mfa.clone()).await;
+    let request = &env.fake.requests_to("/oauth/device/code")[1];
+    let fields: std::collections::HashMap<_, _> = request.form_fields().into_iter().collect();
+    assert_eq!(fields["acr_values"], "urn:meros:acr:mfa");
+    assert_eq!(
+        env.fake
+            .state()
+            .device_sign_ins
+            .values()
+            .last()
+            .map(|d| d.acr_values.clone()),
+        Some(Some("urn:meros:acr:mfa".to_string()))
+    );
+    // Without acr_values nothing extra is sent.
+    let plain = &env.fake.requests_to("/oauth/device/code")[0];
+    assert!(!plain.form_fields().iter().any(|(k, _)| k == "acr_values"));
+
+    env.fake
+        .approve_device(start["user_code"].as_str().unwrap());
+    let done = env.ok("signin.poll", json!({})).await;
+    assert_eq!(
+        (done["user"]["id"].clone(), done["acr_values"].clone()),
+        (json!("u1"), json!("urn:meros:acr:mfa"))
+    );
+    // Same session, new tokens.
+    let list = env.ok("signin.list", json!({})).await;
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
+    let after = env.ok("signin.token", json!({})).await;
+    assert_ne!(after["access_token"], first["access_token"]);
+}
+
+#[tokio::test]
+async fn clearing_events_drops_what_waits_without_sending_it() {
+    let env = Env::new();
+    env.sign_in().await;
+    let queued = env
+        .ok(
+            "events.send",
+            json!({"flush": false, "events": [{"type": "example-app.a.b"}, {"type": "example-app.c.d"}]}),
+        )
+        .await;
+    assert_eq!(queued["pending"], 2);
+    let cleared = env.ok("events.clear", json!({})).await;
+    assert_eq!(cleared["cleared"], 2);
+    let flushed = env.ok("events.flush", json!({})).await;
+    assert_eq!(
+        (flushed["delivered"].clone(), flushed["pending"].clone()),
+        (json!(0), json!(0))
+    );
+    assert!(env.fake.state().events.is_empty());
+    assert!(env.fake.requests_to("/v1/events").is_empty());
+    // Clearing needs no service and nothing waiting.
+    let mut input = env.base();
+    input.as_object_mut().unwrap().remove("issuer");
+    let o = cli::run("events.clear", input, env.fake.clone()).await;
+    assert_eq!((o.exit, o.output["cleared"].clone()), (exit::OK, json!(0)));
+}

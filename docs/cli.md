@@ -152,6 +152,12 @@ Asks for a code. Returns:
 Show `user_code` and `verification_uri`, or `verification_uri_complete` as a
 QR code.
 
+Optional `acr_values`, such as `urn:meros:acr:mfa`, asks for a two-factor
+sign-in: the step-up after a `mfa_required` refusal. It is kept with the
+pending grant. When the poll completes on a session already signed in as
+the same user, that session is upgraded in place: same handle, same user,
+new tokens.
+
 ### `signin.poll`
 
 Call it every `interval` seconds:
@@ -159,7 +165,8 @@ Call it every `interval` seconds:
 - `{"status": "pending", "interval": 5}`: wait and poll again. The interval
   goes up when the service says to slow down; use the new value.
 - `{"status": "signed_in", "user": {"id", "name", "email"}}`: done. The
-  session is stored.
+  session is stored. When the grant asked for `acr_values`, they're echoed
+  back as `acr_values`.
 - Exit 1 with `access_denied` or `expired_token`: the sign-in is forgotten;
   start again.
 - Exit 4 with `no_sign_in`: nothing was started.
@@ -434,6 +441,13 @@ that already took one counts it as a duplicate.
 ### `events.flush`
 
 Delivers what's waiting. Same output.
+
+### `events.clear`
+
+Drops every event waiting in `events/outbox.json` without sending it. Use it
+when the app's user turns event reporting off, so nothing queued earlier
+leaves later. Returns `{cleared, pending: 0}`. Needs no `issuer` or
+`product`. The local log is kept.
 
 ## Testing
 

@@ -381,6 +381,8 @@ impl FakeState {
 pub struct FakeDeviceSignIn {
     pub user_code: String,
     pub scope: String,
+    /// The `acr_values` asked for, such as a two-factor step-up.
+    pub acr_values: Option<String>,
     /// `None` while waiting; `Some(true)` approved, `Some(false)` declined.
     pub approved: Option<bool>,
     pub expires_at: i64,
@@ -570,6 +572,7 @@ impl FakeMeros {
                     FakeDeviceSignIn {
                         user_code: user_code.clone(),
                         scope: f.get("scope").cloned().unwrap_or_default(),
+                        acr_values: f.get("acr_values").cloned(),
                         approved: None,
                         expires_at: clock + DEVICE_CODE_LIFETIME,
                         interval: DEVICE_POLL_INTERVAL,
