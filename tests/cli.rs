@@ -971,6 +971,20 @@ async fn a_key_file_seals_every_secret_and_is_required_to_read_them() {
 }
 
 #[tokio::test]
+async fn read_only_commands_answer_before_the_key_file_exists() {
+    let env = Env::new();
+    let key_file = env.dir.path().join("secret.key");
+    let sealed = json!({"key_file": key_file.to_str().unwrap()});
+    assert_eq!(
+        env.ok("signin.status", sealed.clone()).await["signed_in"],
+        false
+    );
+    let list = env.ok("signin.list", sealed).await;
+    assert_eq!(list["sessions"].as_array().map(Vec::len), Some(0));
+    assert!(!key_file.exists());
+}
+
+#[tokio::test]
 async fn entitlements_report_held_features_through_a_thirty_day_grace() {
     let env = Env::new();
     env.fake.state().features.insert("example-app.sync".into());

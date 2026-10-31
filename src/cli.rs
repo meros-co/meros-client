@@ -464,7 +464,12 @@ impl State {
     /// made the lock file, so a read never sees a half-finished call.
     fn open_read_only(dir: &str, key_file: Option<&str>) -> Result<State, Error> {
         let dir = PathBuf::from(dir);
-        let key = key_file.map(|k| load_key(k, &dir, false)).transpose()?;
+        // No key file yet means nothing was ever sealed with it: read on
+        // without one rather than fail.
+        let key = key_file
+            .filter(|k| Path::new(k).exists())
+            .map(|k| load_key(k, &dir, false))
+            .transpose()?;
         let lock = match File::open(dir.join("lock")) {
             Ok(f) => {
                 f.lock_shared().map_err(state_error)?;
