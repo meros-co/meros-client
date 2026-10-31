@@ -1,19 +1,15 @@
 //! Real requests to a staging service, through the reqwest transport, that
-//! change nothing there: refusals only. Skipped unless the hosts are given:
+//! change nothing there: refusals only. Skipped unless the host is given in
+//! `MEROS_STAGING_DEVICE_BASE`: a product's staging device base
+//! (`<host>/app/<product>`, or a service's own root).
 //!
-//! - `MEROS_STAGING_ISSUER`: the staging issuer origin;
-//! - `MEROS_STAGING_DEVICE_BASE`: a product's staging device base
-//!   (`<host>/app/<product>`, or a service's own root).
-//!
-//! Never point these at production.
+//! Never point it at production. No test here sends a deliberately bad
+//! bearer token: those raise alerts on the service.
 
 use std::sync::Arc;
 
 use meros_client::testing::TestDevice;
-use meros_client::{
-    Collector, Emitter, EmitterConfig, Event, LicenseClient, LicenseConfig, MerosCloud,
-    ReqwestTransport, Severity, StaticToken, SupportApi, Transport,
-};
+use meros_client::{LicenseClient, LicenseConfig, ReqwestTransport, SupportApi, Transport};
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -52,41 +48,4 @@ async fn the_device_api_refuses_an_unknown_key_and_device() {
         ["unknown_device", "bad_signature"].contains(&e.code.as_str()),
         "{e:?}"
     );
-}
-
-#[tokio::test]
-async fn the_cloud_and_event_ingest_refuse_a_bad_token() {
-    let Some(issuer) = env("MEROS_STAGING_ISSUER") else {
-        eprintln!("skipped: MEROS_STAGING_ISSUER is not set");
-        return;
-    };
-    let transport: Arc<dyn Transport> = Arc::new(ReqwestTransport::new());
-    let cloud = MerosCloud::new(
-        issuer.clone(),
-        transport.clone(),
-        Arc::new(StaticToken("not-a-token".into())),
-    );
-    let e = cloud.accounts().await.unwrap_err();
-    assert_eq!(e.status, Some(401), "{e:?}");
-
-    let dir = tempfile::tempdir().unwrap();
-    let emitter = Emitter::open(
-        EmitterConfig {
-            dir: dir.path().to_path_buf(),
-            product: "example-app".into(),
-            version: "0.0.0".into(),
-            edition: None,
-            site: None,
-        },
-        vec![Collector {
-            url: issuer,
-            token: Some(Arc::new(StaticToken("not-a-token".into()))),
-        }],
-        transport,
-    )
-    .unwrap();
-    emitter.emit(Event::new("example-app.check.ran", Severity::Debug));
-    let report = emitter.flush().await;
-    assert_eq!((report.delivered, report.failed), (0, 1));
-    assert_eq!(emitter.pending(), 1, "refused events stay queued");
 }
