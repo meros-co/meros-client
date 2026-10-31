@@ -2082,6 +2082,14 @@ async fn instance_members_are_kept_and_verified_offline() {
         json!({"name": "operator", "label": "Operator"})
     );
     assert_eq!(
+        (
+            m["reason"].clone(),
+            m["default_role"].clone(),
+            m["admin_role"].clone()
+        ),
+        (json!(null), json!("operator"), json!("admin"))
+    );
+    assert_eq!(
         m["expires_at"].as_i64().unwrap() - m["issued_at"].as_i64().unwrap(),
         7 * 86_400
     );

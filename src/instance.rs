@@ -47,6 +47,10 @@ pub struct MembersStatement {
     pub v: u32,
     pub typ: String,
     pub kid: String,
+    /// The instance it was issued to: a statement relayed or copied can't
+    /// be used by another.
+    pub device_id: String,
+    pub device_pubkey: String,
     pub product: String,
     /// The account holding the instance's license.
     pub account_id: String,
@@ -56,8 +60,18 @@ pub struct MembersStatement {
     /// personally owned instance or when the team's add-on has lapsed, and
     /// then `members` is empty.
     pub enabled: bool,
+    /// Why not, when `enabled` is false: `personal_account`, or
+    /// `not_entitled` (the team lacks the add-on).
+    #[serde(default)]
+    pub reason: Option<String>,
     #[serde(default)]
     pub roles: Vec<MemberRole>,
+    /// The role team members get by default, and the one owners and admins
+    /// get.
+    #[serde(default)]
+    pub default_role: Option<String>,
+    #[serde(default)]
+    pub admin_role: Option<String>,
     #[serde(default)]
     pub members: Vec<Member>,
     /// Opaque; sent back to ask whether anything changed.
@@ -81,13 +95,15 @@ impl MembersStatement {
 }
 
 /// Verifies a members statement: the product key's Ed25519 signature over
-/// the exact payload bytes, the type, and that it is for this product.
-/// Whether it has expired is the caller's to decide (see
-/// [`MembersStatement::expired`]).
+/// the exact payload bytes, the type, and that it was issued to this product
+/// and instance (device id and key). Whether it has expired is the caller's
+/// to decide (see [`MembersStatement::expired`]).
 pub fn verify_members(
     keys: &[(&str, &str)],
     statement: &str,
     product: &str,
+    device_id: &str,
+    device_pubkey: &str,
 ) -> Result<MembersStatement, String> {
     let (payload_b64, sig_b64) = statement
         .trim()
@@ -119,8 +135,8 @@ pub fn verify_members(
     if s.v != 1 || s.typ != "instance_members" {
         return Err("not a members statement".into());
     }
-    if s.product != product {
-        return Err("statement is for another product".into());
+    if s.product != product || s.device_id != device_id || s.device_pubkey != device_pubkey {
+        return Err("statement is for another product or instance".into());
     }
     Ok(s)
 }
@@ -196,18 +212,20 @@ impl InstanceClient {
                 )
             })?
             .to_string();
+        let id = self.device.identity().ok_or_else(Error::no_identity)?;
         let keys: Vec<(&str, &str)> = self
             .keys
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let members = verify_members(&keys, &statement, &self.product).map_err(|e| {
-            Error::new(
-                None,
-                "verify_failed",
-                format!("The members statement: {e}."),
-            )
-        })?;
+        let members = verify_members(&keys, &statement, &self.product, &id.id, &id.pubkey)
+            .map_err(|e| {
+                Error::new(
+                    None,
+                    "verify_failed",
+                    format!("The members statement: {e}."),
+                )
+            })?;
         Ok(MembersAnswer {
             statement,
             members,

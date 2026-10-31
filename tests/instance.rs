@@ -41,7 +41,7 @@ async fn an_instance_gets_its_members_as_itself_and_a_signed_statement() {
     let a = c.members(None).await.unwrap();
     assert!(!a.unchanged);
     let m = &a.members;
-    assert!(m.enabled);
+    assert!(m.enabled && m.reason.is_none());
     assert_eq!(
         (
             m.product.as_str(),
@@ -49,6 +49,14 @@ async fn an_instance_gets_its_members_as_itself_and_a_signed_statement() {
             m.account_name.as_str()
         ),
         ("example-app", "acct-team", "Crew")
+    );
+    assert_eq!(
+        (
+            m.device_id.as_str(),
+            m.default_role.as_deref(),
+            m.admin_role.as_deref()
+        ),
+        ("rack-1", Some("operator"), Some("admin"))
     );
     assert_eq!(m.exp - m.iat, 7 * 86_400);
     assert_eq!(m.version.len(), 32);
@@ -87,12 +95,13 @@ async fn an_instance_gets_its_members_as_itself_and_a_signed_statement() {
 }
 
 #[tokio::test]
-async fn a_personal_instance_or_a_lapsed_gate_gets_no_members() {
+async fn a_personal_instance_or_a_lapsed_gate_gets_no_members_and_says_why() {
     let fake = FakeMeros::new();
     let device = known(&fake, "rack-1");
     fake.state().members_enabled = false;
     let m = client(&fake, &device).members(None).await.unwrap().members;
     assert!(!m.enabled && m.members.is_empty());
+    assert_eq!(m.reason.as_deref(), Some("not_entitled"));
     assert!(!m.roles.is_empty(), "the roles are still listed");
 
     let fake = FakeMeros::new();
@@ -100,6 +109,7 @@ async fn a_personal_instance_or_a_lapsed_gate_gets_no_members() {
     fake.state().team = None;
     let m = client(&fake, &device).members(None).await.unwrap().members;
     assert!(!m.enabled && m.members.is_empty());
+    assert_eq!(m.reason.as_deref(), Some("personal_account"));
     assert_eq!(m.account_id, "acct-personal");
 }
 
@@ -112,7 +122,7 @@ async fn an_unknown_instance_is_refused() {
 }
 
 #[tokio::test]
-async fn statements_verify_only_for_their_product_and_key() {
+async fn statements_verify_only_for_their_product_instance_and_key() {
     let fake = FakeMeros::new();
     let device = known(&fake, "rack-1");
     let token = client(&fake, &device)
@@ -120,14 +130,28 @@ async fn statements_verify_only_for_their_product_and_key() {
         .await
         .unwrap()
         .statement;
+    let pk = device.identity().unwrap().pubkey;
     let k = keys();
     let table: Vec<(&str, &str)> = k.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-    assert!(verify_members(&table, &token, "example-app").is_ok());
-    assert!(verify_members(&table, &token, "other-app").is_err());
+    assert!(verify_members(&table, &token, "example-app", "rack-1", &pk).is_ok());
+    assert!(verify_members(&table, &token, "other-app", "rack-1", &pk).is_err());
+    // Relayed or copied to another instance, it doesn't verify there.
+    assert!(verify_members(&table, &token, "example-app", "rack-2", &pk).is_err());
+    let other = TestDevice::new("rack-2").identity().unwrap().pubkey;
+    assert!(verify_members(&table, &token, "example-app", "rack-1", &other).is_err());
     let (payload, sig) = token.split_once('.').unwrap();
     let tampered = format!("{}x.{sig}", &payload[..payload.len() - 1]);
-    assert!(verify_members(&table, &tampered, "example-app").is_err());
-    assert!(verify_members(&[("other-kid", &k[0].1)], &token, "example-app").is_err());
-    let s = verify_members(&table, &token, "example-app").unwrap();
+    assert!(verify_members(&table, &tampered, "example-app", "rack-1", &pk).is_err());
+    assert!(
+        verify_members(
+            &[("other-kid", &k[0].1)],
+            &token,
+            "example-app",
+            "rack-1",
+            &pk
+        )
+        .is_err()
+    );
+    let s = verify_members(&table, &token, "example-app", "rack-1", &pk).unwrap();
     assert!(!s.expired(s.iat) && s.expired(s.exp));
 }

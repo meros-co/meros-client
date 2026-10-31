@@ -551,26 +551,28 @@ token. The instance must be known to Meros (activated, or registered).
 Input: `product`, `keys` (the product's statement keys). Returns:
 
 ```json
-{"enabled": true, "account_id": "...", "account_name": "Crew",
+{"enabled": true, "reason": null, "account_id": "...", "account_name": "Crew",
  "roles": [{"name": "admin", "label": "Administrator"},
            {"name": "operator", "label": "Operator"},
            {"name": "viewer", "label": "Viewer"}],
+ "default_role": "operator", "admin_role": "admin",
  "members": [{"sub": "...", "name": "Pat", "email": "pat@example.com",
               "team_role": "owner", "role": "admin"}],
  "version": "...", "issued_at": 1793470000, "expires_at": 1794074800,
  "expired": false, "unchanged": false, "cached": false}
 ```
 
-- `enabled` false (a personally owned instance, or a team whose add-on has
-  lapsed) comes with no members: cloud users can't be used here now.
+- `enabled` false comes with no members: cloud users can't be used here
+  now. `reason` says why: `personal_account`, or `not_entitled` (the team
+  lacks the add-on).
 - A member's `role` is one of the `roles` names, or null for no access.
   Accept a person only when their `sub` is a member with a role, and apply
-  that role. By default owners and admins get the admin role, members the
-  default role, and billing no access; team admins can change it per
+  that role. By default owners and admins get `admin_role`, members
+  `default_role`, and billing no access; team admins can change it per
   product.
-- The answer comes with a statement signed with the product key, which
-  lasts seven days. It is verified before anything is reported and kept in
-  `members.json`.
+- The answer comes with a statement signed with the product key, issued to
+  this instance (its device id and key) and lasting seven days. It is
+  verified before anything is reported and kept in `members.json`.
 - The kept version is sent each time: when nothing changed, the answer is
   the same list with `unchanged: true` and a fresh statement.
 - Call it at each sign-in and after reconnecting, never on a timer.
@@ -583,10 +585,11 @@ Input: `product`, `keys` (the product's statement keys). Returns:
 
 ### `instance.members.verify`
 
-Verifies `statement`, or the kept one, offline, against `keys` and the
-product. Returns the same view (without `unchanged` and `cached`).
-Exit 4 `not_cached` with nothing kept, `verify_failed` for a statement that
-doesn't verify. Read-only.
+Verifies `statement`, or the kept one, offline, against `keys`, the product
+and this instance: a statement issued to another instance doesn't verify.
+Returns the same view (without `unchanged` and `cached`). Exit 4
+`not_cached` with nothing kept, `verify_failed` for a statement that doesn't
+verify. Read-only.
 
 ## Device licenses
 

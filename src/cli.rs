@@ -1553,13 +1553,14 @@ impl Ctx {
         let verify = |statement: &str| -> Result<crate::MembersStatement, Error> {
             let table: Vec<(&str, &str)> =
                 keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            crate::verify_members(&table, statement, &product).map_err(|e| {
-                Error::new(
-                    None,
-                    "verify_failed",
-                    format!("The members statement: {e}."),
-                )
-            })
+            crate::verify_members(&table, statement, &product, &device.id, &device.pubkey())
+                .map_err(|e| {
+                    Error::new(
+                        None,
+                        "verify_failed",
+                        format!("The members statement: {e}."),
+                    )
+                })
         };
         match op {
             "members" => {
@@ -2777,9 +2778,12 @@ const MEMBERS: &str = "members.json";
 fn members_view(s: &crate::MembersStatement) -> Value {
     json!({
         "enabled": s.enabled,
+        "reason": s.reason,
         "account_id": s.account_id,
         "account_name": s.account_name,
         "roles": s.roles,
+        "default_role": s.default_role,
+        "admin_role": s.admin_role,
         "members": s.members,
         "version": s.version,
         "issued_at": s.iat,

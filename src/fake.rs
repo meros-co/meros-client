@@ -1076,13 +1076,19 @@ fn instance_members(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
     let account = st.team.clone().unwrap_or_else(|| PERSONAL.to_string());
     let (account_name, _) = account_label(st, &account);
     let enabled = st.members_enabled && st.team.is_some();
+    let reason = match (enabled, st.team.is_some()) {
+        (true, _) => None,
+        (false, true) => Some("not_entitled"),
+        (false, false) => Some("personal_account"),
+    };
     let members = if enabled {
         st.instance_members.clone()
     } else {
         Vec::new()
     };
     let content = json!({"product": product, "account_id": account, "account_name": account_name,
-        "enabled": enabled, "roles": st.member_roles, "members": members});
+        "enabled": enabled, "reason": reason, "roles": st.member_roles,
+        "default_role": "operator", "admin_role": "admin", "members": members});
     let version: String = Sha256::digest(content.to_string().as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1092,10 +1098,12 @@ fn instance_members(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
     let now = unix_now();
     let expires = now + 7 * 86_400;
     let payload = json!({
-        "v": 1, "typ": "instance_members", "kid": SERVER_KID, "product": product,
-        "account_id": account, "account_name": account_name, "enabled": enabled,
-        "roles": st.member_roles, "members": members, "version": version,
-        "iat": now, "exp": expires,
+        "v": 1, "typ": "instance_members", "kid": SERVER_KID,
+        "device_id": f.get("device_id"), "device_pubkey": f.get("device_pubkey"),
+        "product": product, "account_id": account, "account_name": account_name,
+        "enabled": enabled, "reason": reason, "roles": st.member_roles,
+        "default_role": "operator", "admin_role": "admin", "members": members,
+        "version": version, "iat": now, "exp": expires,
     });
     let bytes = serde_json::to_vec(&payload).unwrap_or_default();
     let sig = ed25519_dalek::SigningKey::from_bytes(&SERVER_SEED).sign(&bytes);
@@ -1112,9 +1120,10 @@ fn instance_members(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
     }
     reply(
         200,
-        json!({"enabled": enabled, "account_id": account, "account_name": account_name,
-               "roles": st.member_roles, "members": members, "version": version,
-               "statement": statement, "expires_at": expires}),
+        json!({"enabled": enabled, "reason": reason, "account_id": account,
+               "account_name": account_name, "roles": st.member_roles,
+               "default_role": "operator", "admin_role": "admin", "members": members,
+               "version": version, "statement": statement, "expires_at": expires}),
     )
 }
 
