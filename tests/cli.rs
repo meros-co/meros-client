@@ -1187,3 +1187,93 @@ async fn clearing_events_drops_what_waits_without_sending_it() {
     let o = cli::run("events.clear", input, env.fake.clone()).await;
     assert_eq!((o.exit, o.output["cleared"].clone()), (exit::OK, json!(0)));
 }
+
+#[tokio::test]
+async fn a_cache_only_feed_read_never_touches_the_network() {
+    let env = Env::new();
+    let read = json!({"pack": "regions", "cache_only": true});
+    // Nothing cached yet: exit 4, and no request was made.
+    assert_eq!(
+        env.refused("cloud.feed", read.clone()).await,
+        (exit::LOCAL, "not_cached".into())
+    );
+    assert!(env.fake.state().requests.is_empty());
+    env.fake
+        .publish_pack("example-app", "regions", json!({"zones": [5]}), false);
+    env.ok("cloud.feed", json!({"pack": "regions"})).await;
+    let asked = env.fake.state().requests.len();
+    // Offline transport and no issuer: the cache answers, verified.
+    let mut input = env.base();
+    input.as_object_mut().unwrap().remove("issuer");
+    input["pack"] = json!("regions");
+    input["cache_only"] = json!(true);
+    let o = cli::run("cloud.feed", input.clone(), Arc::new(Offline)).await;
+    assert_eq!(o.exit, exit::OK, "{}", o.output);
+    assert_eq!(
+        (
+            o.output["payload"]["zones"].clone(),
+            o.output["from_cache"].clone()
+        ),
+        (json!([5]), json!(true))
+    );
+    assert_eq!(env.fake.state().requests.len(), asked);
+    input["keys"] = json!({ENTITLEMENT_KID: server_keys()[0].1});
+    let o = cli::run("cloud.feed", input, Arc::new(Offline)).await;
+    assert_eq!(o.output["error"]["code"], "verify_failed");
+}
+
+#[tokio::test]
+async fn an_event_keeps_the_time_it_happened() {
+    let env = Env::new();
+    env.sign_in().await;
+    env.ok(
+        "events.send",
+        json!({"events": [{"type": "example-app.mic.dropped", "occurred_at": "2026-10-30T19:42:07.125Z"}]}),
+    )
+    .await;
+    assert_eq!(
+        env.fake.state().events[0]["occurred_at"],
+        "2026-10-30T19:42:07.125Z"
+    );
+    let bad = env
+        .run(
+            "events.send",
+            json!({"events": [{"type": "example-app.x.y", "occurred_at": "yesterday"}]}),
+        )
+        .await;
+    assert_eq!(bad.exit, exit::USAGE);
+}
+
+#[tokio::test]
+async fn sign_out_says_whether_the_service_revoked_the_session() {
+    let env = Env::new();
+    env.sign_in().await;
+    let out = env.ok("signin.signout", json!({})).await;
+    assert_eq!(out["revoked"], true);
+    // Offline the session is still forgotten, but not revoked.
+    env.sign_in().await;
+    let o = cli::run("signin.signout", env.base(), Arc::new(Offline)).await;
+    assert_eq!(
+        (o.exit, o.output["revoked"].clone()),
+        (exit::OK, json!(false))
+    );
+    assert_eq!(env.ok("signin.status", json!({})).await["signed_in"], false);
+    // Nothing to revoke.
+    assert_eq!(env.ok("signin.signout", json!({})).await["revoked"], false);
+}
+
+#[tokio::test]
+async fn a_document_conflict_says_when_the_other_copy_was_saved() {
+    let env = Env::new();
+    env.sign_in().await;
+    let doc =
+        |body: Value| json!({"collection": "shows", "key": "k", "body": body, "base_version": 0});
+    env.ok("cloud.docs.put", doc(json!({"a": 1}))).await;
+    let o = env.run("cloud.docs.put", doc(json!({"a": 2}))).await;
+    assert_eq!(o.output["error"]["code"], "version_conflict");
+    assert!(
+        o.output["error"]["head_updated_at"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("2026-"))
+    );
+}

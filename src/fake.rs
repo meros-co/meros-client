@@ -1731,6 +1731,7 @@ fn docs(
                     json!({"error": "version_conflict", "message": "Stale.", "head": {
                         "version": head,
                         "content_hash": st.docs.get(&id).and_then(|l| l.last()).map(|d| crate::cloud::content_hash(&d.body)),
+                        "updated_at": st.time(),
                     }}),
                 );
             }

@@ -132,6 +132,7 @@ pub const READ_ONLY: &[&str] = &[
 
 const LOCAL_CODES: &[&str] = &[
     "unknown_request",
+    "not_cached",
     "state_error",
     "verify_failed",
     "no_device_identity",
@@ -193,8 +194,13 @@ fn failure(e: Error) -> Outcome {
     if let Some(v) = e.head_version {
         error["head_version"] = json!(v);
     }
-    if let Some(h) = &e.head_content_hash {
-        error["head_content_hash"] = json!(h);
+    if let Some(h) = &e.head {
+        if let Some(c) = &h.content_hash {
+            error["head_content_hash"] = json!(c);
+        }
+        if let Some(t) = &h.updated_at {
+            error["head_updated_at"] = json!(t);
+        }
     }
     Outcome {
         exit,
@@ -1018,7 +1024,7 @@ impl Ctx {
             }
             "signout" => {
                 let auth = self.auth()?;
-                auth.sign_out().await;
+                let revoked = auth.sign_out().await;
                 state.remove(pending);
                 let prefix = format!("{}-", self.session()?);
                 if let Ok(entries) = fs::read_dir(state.path("cache")) {
@@ -1028,7 +1034,7 @@ impl Ctx {
                         }
                     }
                 }
-                Ok(json!({}))
+                Ok(json!({"revoked": revoked}))
             }
             "list" => Ok(
                 json!({"sessions": self.sessions()?.into_iter().map(|(h, u)| json!({
@@ -1414,7 +1420,8 @@ impl Ctx {
                     // current, and nothing for anyone to resolve.
                     Err(e)
                         if e.code == "version_conflict"
-                            && e.head_content_hash.as_deref() == Some(hash.as_str()) =>
+                            && e.head.as_ref().and_then(|h| h.content_hash.as_deref())
+                                == Some(hash.as_str()) =>
                     {
                         Ok(
                             json!({"version": e.head_version, "content_hash": hash, "unchanged": true}),
@@ -1515,8 +1522,12 @@ impl Ctx {
     /// A pack verified against `keys`, cached with its `ETag`: a current
     /// cached copy answers `304`, and offline the cached copy stands.
     async fn feed(&self, op: &str) -> Result<Value, Error> {
-        let issuer = self.issuer()?;
         let (product, pack) = (self.req("product")?, self.req("pack")?);
+        let cache_only = self.input.get("cache_only").and_then(|v| v.as_bool()) == Some(true);
+        if cache_only && op == "feed" {
+            return self.cached_feed(&product, &pack);
+        }
+        let issuer = self.issuer()?;
         let account = self.opt("account_id");
         let auth = match &self.state {
             Some(_) => {
@@ -1601,6 +1612,37 @@ impl Ctx {
             },
             Err(e) => Err(e),
         }
+    }
+
+    /// The cached latest pack, verified, with no network at all; exit 4
+    /// `not_cached` when there is none.
+    fn cached_feed(&self, product: &str, pack: &str) -> Result<Value, Error> {
+        let keys = self.keys()?;
+        let table: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        if table.is_empty() {
+            return Err(bad_input("Give the product's `keys` to verify packs."));
+        }
+        let state = self.state()?;
+        let cache = format!("cache/feed-{}-{}.json", file_safe(product), file_safe(pack));
+        let c = state.read_json(&cache).ok_or_else(|| {
+            Error::new(
+                None,
+                "not_cached",
+                format!("No copy of {product}/{pack} is cached."),
+            )
+        })?;
+        let (header, payload) = verify_pack(
+            &table,
+            c["signed"].as_str().unwrap_or_default(),
+            c["signature"].as_str().unwrap_or_default(),
+        )
+        .map_err(|e| Error::new(None, "verify_failed", format!("Pack: {e}")))?;
+        Ok(json!({
+            "product": header["product"], "pack": header["pack"],
+            "version": header["version"], "kid": header["kid"],
+            "issued_at": header["issued_at"], "payload": payload,
+            "from_cache": true, "fetched_at": c["fetched_at"],
+        }))
     }
 
     // ── Support ──
@@ -1880,5 +1922,12 @@ fn event_from(e: &Value) -> Result<Event, Error> {
         event.attrs = attrs.clone();
     }
     event.trace = e["trace"].as_str().map(str::to_string);
+    if let Some(t) = e.get("occurred_at").filter(|v| !v.is_null()) {
+        let t = t
+            .as_str()
+            .filter(|t| parse_rfc3339(t).is_some())
+            .ok_or_else(|| bad_input("`occurred_at` must be an RFC 3339 time."))?;
+        event.occurred_at = Some(t.to_string());
+    }
     Ok(event)
 }

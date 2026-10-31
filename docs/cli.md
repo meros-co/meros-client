@@ -223,8 +223,14 @@ after an API refused it.
 
 ### `signin.signout`
 
-Revokes the session on the service and forgets it locally, even offline. It
-also clears `cache/`.
+Revokes the session on the service and forgets it locally, even offline.
+Returns `{revoked}`:
+- `true` when the service revoked it;
+- `false` when the service couldn't be reached, or there was no session. In
+  that case the refresh token stays valid on the service until it idles
+  out; sign out again online to revoke it.
+
+It also clears the session's entries in `cache/`.
 
 ### `signin.login_token`
 
@@ -327,7 +333,7 @@ team account; omitted means the personal one.
 | `cloud.profile.delete` | `namespace` | `{}` |
 | `cloud.docs.list` | `product`, `collection` | `{docs: [{key, head_version, updated}]}` |
 | `cloud.docs.get` | `product`, `collection`, `key`, `version?` | `{key, version, head_version, body, content_hash}` |
-| `cloud.docs.put` | `product`, `collection`, `key`, `body`, `base_version?` | `{version, content_hash, unchanged}`. Exit 1 `version_conflict` with `head_version` and `head_content_hash` when someone saved different content first; an identical copy is `unchanged: true` with the head's version, and nothing is written |
+| `cloud.docs.put` | `product`, `collection`, `key`, `body`, `base_version?` | `{version, content_hash, unchanged}`. Exit 1 `version_conflict` with `head_version`, `head_content_hash` and `head_updated_at` (when the other copy was saved) when someone saved different content first; an identical copy is `unchanged: true` with the head's version, and nothing is written |
 | `cloud.docs.delete` | `product`, `collection`, `key` | `{}` |
 | `cloud.docs.versions` | `product`, `collection`, `key` | `{versions: [{version, created, size_bytes}]}` |
 | `cloud.files.list` | `product`, `collection` | `{files: [{sha256, size, status, created, download_url}]}` |
@@ -385,6 +391,11 @@ An entitled pack answers exit 1 with `http_401` without a session, and
 `not_entitled` without the entitlement. A pack that doesn't verify against
 `keys` is exit 4 `verify_failed`.
 
+With `"cache_only": true` no request is made at all, and no `issuer` is
+needed: the cached latest copy is verified and returned, or the call exits 4
+with `not_cached`. Use it where waiting on the network isn't acceptable, and
+refresh with a normal call when it is.
+
 ### `cloud.feed_versions`
 
 Input: `product`, `pack`. Returns the service's list of versions.
@@ -415,6 +426,7 @@ Input: `events`, an array of:
 
 ```json
 {"type": "product.subject.verb", "severity": "info",
+ "occurred_at": "2026-10-30T19:42:07.125Z",
  "subject": {"kind": "show", "id": "s1", "name": "Main"},
  "actor": {"kind": "user", "id": "u1"},
  "attrs": {"key": "value"}, "trace": "…"}
@@ -422,6 +434,8 @@ Input: `events`, an array of:
 
 - Only `type` is required. `severity` is `debug`, `info` (default),
   `notice`, `warning`, `error` or `critical`.
+- `occurred_at` (RFC 3339) stamps when it happened, for apps that batch
+  events before calling. It defaults to the time of the call.
 - The helper adds the id (a ULID, so a resent batch is recognized as
   duplicates), time, sequence and source.
 - Limits follow the envelope: attributes over 16 KiB keep as many keys as

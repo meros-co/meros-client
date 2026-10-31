@@ -3,6 +3,16 @@
 
 use crate::http::HttpResponse;
 
+/// The document head a 409 `version_conflict` reports.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConflictHead {
+    /// Its `content_hash`, to tell an identical copy (see
+    /// [`crate::content_hash`]) from a real conflict.
+    pub content_hash: Option<String>,
+    /// When it was saved (ISO 8601).
+    pub updated_at: Option<String>,
+}
+
 /// A failed request or flow.
 ///
 /// [`code`](Self::code) is the server's `error` field exactly as sent
@@ -24,9 +34,8 @@ pub struct Error {
     pub retry_after: Option<u64>,
     /// The current version on a 409 `version_conflict`.
     pub head_version: Option<i64>,
-    /// The head's `content_hash` on a 409, to tell an identical copy
-    /// (see [`crate::content_hash`]) from a real conflict.
-    pub head_content_hash: Option<Box<str>>,
+    /// More about the head on a 409 `version_conflict`.
+    pub head: Option<Box<ConflictHead>>,
     /// The most a batch may hold, on 413 `batch_too_large`.
     pub max: Option<usize>,
 }
@@ -39,7 +48,7 @@ impl Error {
             message: message.into(),
             retry_after: None,
             head_version: None,
-            head_content_hash: None,
+            head: None,
             max: None,
         }
     }
@@ -73,10 +82,13 @@ impl Error {
                 .header_value("retry-after")
                 .and_then(|v| v.trim().parse().ok()),
             head_version: body.pointer("/head/version").and_then(|v| v.as_i64()),
-            head_content_hash: body
-                .pointer("/head/content_hash")
-                .and_then(|v| v.as_str())
-                .map(Box::from),
+            head: body.get("head").filter(|h| h.is_object()).map(|h| {
+                let text = |k: &str| h.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                Box::new(ConflictHead {
+                    content_hash: text("content_hash"),
+                    updated_at: text("updated_at"),
+                })
+            }),
             max: body.get("max").and_then(|v| v.as_u64()).map(|v| v as usize),
         }
     }

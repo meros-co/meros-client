@@ -110,6 +110,9 @@ pub struct Event {
     pub actor: Option<Actor>,
     pub attrs: Map<String, Value>,
     pub trace: Option<String>,
+    /// When it happened (RFC 3339), if not when it is emitted: for an app
+    /// that batches events before handing them over.
+    pub occurred_at: Option<String>,
 }
 
 impl Event {
@@ -121,7 +124,14 @@ impl Event {
             actor: None,
             attrs: Map::new(),
             trace: None,
+            occurred_at: None,
         }
+    }
+
+    /// Stamps the event with when it happened (RFC 3339).
+    pub fn at(mut self, occurred_at: &str) -> Event {
+        self.occurred_at = Some(occurred_at.to_string());
+        self
     }
 
     pub fn about(mut self, kind: &str, id: &str, name: Option<&str>) -> Event {
@@ -253,7 +263,7 @@ impl Emitter {
         let envelope = Envelope {
             envelope: ENVELOPE,
             id: ulid(),
-            occurred_at: now_rfc3339(),
+            occurred_at: event.occurred_at.unwrap_or_else(now_rfc3339),
             seq: Some(inner.seq),
             source: inner.source.clone(),
             kind: event.kind,

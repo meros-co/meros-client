@@ -61,7 +61,7 @@ pub use device::EntitlementDevice;
 pub use device::testing;
 pub use device::{DeviceIdentity, DeviceSigner, LicenseDevice};
 pub use environment::Environment;
-pub use error::Error;
+pub use error::{ConflictHead, Error};
 pub use events::{
     Actor, Collector, Emitter, EmitterConfig, Envelope, Event, FlushReport, Severity, Source,
     Subject,

@@ -590,18 +590,19 @@ impl MerosAuth {
     }
 
     /// Revokes `token` (RFC 7009) with this client's id; Meros revokes
-    /// nothing without it. Errors are ignored: revocation is best effort.
-    async fn revoke(&self, token: &str) {
+    /// nothing without it. Best effort: true when the service answered
+    /// (it always answers 200), false when it couldn't be reached.
+    async fn revoke(&self, token: &str) -> bool {
         let revoke = self
             .endpoint_for(|d| d.revocation_endpoint.clone(), "/oauth/revoke")
             .await;
-        let _ = self
-            .transport
+        self.transport
             .send(
                 HttpRequest::new("POST", revoke)
                     .form(&[("token", token), ("client_id", &self.config.client_id)]),
             )
-            .await;
+            .await
+            .is_ok_and(|r| r.ok())
     }
 
     /// Reads the stored session. The other calls do it on first use; call it
@@ -875,18 +876,23 @@ impl MerosAuth {
         t.access_token
     }
 
-    /// Signs out here and revokes the session on the issuer. Offline, the
-    /// local session ends anyway.
-    pub async fn sign_out(&self) {
+    /// Signs out here and revokes the session on the issuer. Returns whether
+    /// the service revoked it: false when it couldn't be reached (the local
+    /// session ends anyway, and the refresh token stays valid on the service
+    /// until it idles out) or when there was no session.
+    pub async fn sign_out(&self) -> bool {
+        self.load().await;
         let access = self.session.lock().unwrap().access.clone();
         let token = match access {
             Some(a) => Some(a),
             None => self.store.read(REFRESH_KEY).await,
         };
-        if let Some(token) = token {
-            self.revoke(&token).await;
-        }
+        let revoked = match token {
+            Some(token) => self.revoke(&token).await,
+            None => false,
+        };
         self.clear().await;
+        revoked
     }
 
     async fn clear(&self) {
