@@ -108,6 +108,7 @@ settings on every call, and add the command's own fields.
 | `sessions/{session}.signin.json` | That identity's device sign-in in progress |
 | `signin/` | Browser sign-ins waiting for their callbacks, two-factor steps waiting for their codes, and the page a loopback sign-in is waiting on |
 | `server.json` | The Server statement and its feature token |
+| `device-registration.json` | The device's registration and the session that made it |
 | `license.json` | The device entitlement token |
 | `events/` | The local event log, the install's identity, and undelivered events (`outbox.json`) |
 | `cache/` | The last entitlements answer (per session) and the latest copy of each pack, for offline use. A session's entries are cleared when it signs out |
@@ -167,6 +168,28 @@ result.
 ### `device.identity`
 
 Returns `{device_id, pubkey}` and makes the key on first use.
+
+### `device.register` and `device.unregister`
+
+For products whose devices hold no license seat. `device.register` records
+this device under the account of the user signed in to the Server session
+(`session`, default `server`; see Clients and sessions). A registered device
+counts as known to meros.co: its pushed sign-ins may use public host names,
+and members of its account see no security warning.
+
+- Input: `product`, plus optional `device_name` and `model` (default: the
+  OS and architecture).
+- Returns `{device_id, account_id, account_name, registered_at}`.
+  Registering again with the same key updates the name and model.
+- The request carries the session's token and is signed with the device key
+  over `POST|{path}|{device_id}|{ts}|{nonce}`, a fresh nonce each time.
+- Refusals include `device_id_in_use` (registered to another account or
+  with another key), `insufficient_scope`, `forbidden`, `bad_signature`
+  and `unauthenticated`; exit 4 `no_sign_in` without a session.
+
+`device.unregister` removes it and returns `{unregistered}`, false when it
+wasn't registered. Signing the registering session out
+(`signin.signout`) unregisters the device first.
 
 ## Sign in with Meros
 
@@ -397,7 +420,11 @@ Returns `{revoked}`:
   that case the refresh token stays valid on the service until it idles
   out; sign out again online to revoke it.
 
-It also clears the session's entries in `cache/`.
+It also clears the session's entries in `cache/`. When this session
+registered the device (`device.register`), the device is unregistered first,
+and the answer adds `device_registration: {unregistered, error?}`. If that
+fails, the registration is kept so `device.unregister` can be run after
+signing in again.
 
 ### `signin.login_token`
 
@@ -706,6 +733,8 @@ Useful knobs for `fake.set`:
     `password_clients`, `password_refusal` (`[status, code]`);
   - `id_token_overrides` (claims laid over every id_token);
   - `sso_audiences`, `sso_sub`;
+- device registration: `registered_devices` (id → `[pubkey, account]`),
+  `devices_scope` (false refuses with `insufficient_scope`);
 - refusals: `support_rate_limited`, `open_ticket_cap`, `unknown_products`;
 - limits: `event_batch_cap`, `file_cap` and `file_quota`.
 

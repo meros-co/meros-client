@@ -1754,3 +1754,69 @@ async fn fake_mode_answers_the_sign_in_page_and_approves_loopback_at_once() {
     .await;
     assert_eq!(e.output["error"]["code"], "access_denied");
 }
+
+#[tokio::test]
+async fn a_seatless_device_registers_as_the_server_and_unregisters_on_sign_out() {
+    let env = Env::new();
+    let (code, err) = env.refused("device.register", json!({})).await;
+    assert_eq!((code, err.as_str()), (exit::LOCAL, "no_sign_in"));
+
+    let server = json!({"client": "server", "server_client_id": "server-client"});
+    let mut begin = server.clone();
+    begin["redirect_uri"] = json!(SERVER_CALLBACK);
+    let b = env.ok("signin.browser.begin", begin).await;
+    let callback = env.fake.approve(b["authorize_url"].as_str().unwrap());
+    env.ok("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+
+    let r = env
+        .ok("device.register", json!({"device_name": "Booth"}))
+        .await;
+    let me = env.ok("device.identity", json!({})).await;
+    assert_eq!(r["device_id"], me["device_id"]);
+    assert_eq!(r["account_id"], PERSONAL);
+    assert!(env.state_file("device-registration.json").exists());
+    // Known now: a public host name may take the sign-in.
+    env.ok(
+        "signin.browser.begin",
+        json!({"redirect_uri": "https://panel.example.com/cb"}),
+    )
+    .await;
+
+    let out = env.ok("signin.signout", json!({"session": "server"})).await;
+    assert_eq!(out["device_registration"]["unregistered"], true);
+    assert!(env.fake.state().registered_devices.is_empty());
+    assert!(!env.state_file("device-registration.json").exists());
+    let (code, err) = env
+        .refused(
+            "signin.browser.begin",
+            json!({"redirect_uri": "https://panel.example.com/cb"}),
+        )
+        .await;
+    assert_eq!(
+        (code, err.as_str()),
+        (exit::REFUSED, "invalid_redirect_uri")
+    );
+}
+
+#[tokio::test]
+async fn device_unregister_removes_the_registration() {
+    let env = Env::new();
+    let b = env
+        .ok(
+            "signin.browser.begin",
+            json!({"client": "server", "server_client_id": "server-client", "redirect_uri": SERVER_CALLBACK}),
+        )
+        .await;
+    let callback = env.fake.approve(b["authorize_url"].as_str().unwrap());
+    env.ok("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+    env.ok("device.register", json!({})).await;
+    let out = env.ok("device.unregister", json!({})).await;
+    assert_eq!(out["unregistered"], true);
+    let out = env.ok("device.unregister", json!({})).await;
+    assert_eq!(out["unregistered"], false);
+    // A sign-out after that has nothing to unregister.
+    let out = env.ok("signin.signout", json!({"session": "server"})).await;
+    assert!(out.get("device_registration").is_none());
+}

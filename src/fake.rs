@@ -224,6 +224,12 @@ pub struct FakeState {
     pub challenges: HashMap<String, (String, u32, i64)>,
     /// Device signatures already taken; each is accepted once.
     pub used_signatures: HashSet<String>,
+    /// Devices registered without a seat: id → (public key, account).
+    /// They count as known for pushed sign-ins.
+    pub registered_devices: HashMap<String, (String, String)>,
+    /// Whether signed-in tokens carry `devices:write`; without it device
+    /// registration answers `403 insufficient_scope`.
+    pub devices_scope: bool,
     /// Claims laid over every id_token, to test a client's checks (a
     /// foreign `aud`, a wrong `nonce`, an old `exp`).
     pub id_token_overrides: Map<String, Value>,
@@ -303,6 +309,8 @@ impl Default for FakeState {
             challenges: HashMap::new(),
             used_signatures: HashSet::new(),
             id_token_overrides: Map::new(),
+            registered_devices: HashMap::new(),
+            devices_scope: true,
             codes: HashMap::new(),
             request_product: "example-app".into(),
             refresh: HashSet::new(),
@@ -740,6 +748,9 @@ impl FakeMeros {
             }
             ["oauth", "par"] if st.par && r.method == "POST" => par(&mut st, &r),
             ["oauth", "token"] => oauth_token(&mut st, &r, &issuer),
+            ["v1", "device", op @ ("register" | "unregister")] if r.method == "POST" => {
+                device_registration(&mut st, &r, op)
+            }
             ["v1", "feeds", product, pack, rest @ ..] if r.method == "GET" => {
                 let signed_in = r
                     .header_value("Authorization")
@@ -918,7 +929,11 @@ fn signed_body(st: &mut FakeState, r: &HttpRequest, path: &str) -> Result<bool, 
     let id = f.get("device_id").cloned().unwrap_or_default();
     let pubkey = f.get("device_pubkey").cloned().unwrap_or_default();
     let ts: i64 = f.get("ts").and_then(|t| t.parse().ok()).unwrap_or(0);
-    let known = st.devices.get(&id).cloned();
+    let known = st
+        .devices
+        .get(&id)
+        .cloned()
+        .or_else(|| st.registered_devices.get(&id).map(|(k, _)| k.clone()));
     if known.as_ref().is_some_and(|k| *k != pubkey) {
         return Err(bad("another key"));
     }
@@ -945,6 +960,71 @@ fn signed_body(st: &mut FakeState, r: &HttpRequest, path: &str) -> Result<bool, 
         return Err(bad("replayed"));
     }
     Ok(known.is_some())
+}
+
+/// `POST /v1/device/register` and `/unregister`: the user's bearer token
+/// (with `devices:write`) and the device's signature over
+/// `POST|{path}|{device_id}|{ts}|{nonce}`, each signature once.
+fn device_registration(st: &mut FakeState, r: &HttpRequest, op: &str) -> HttpResponse {
+    let token = r
+        .header_value("Authorization")
+        .unwrap_or("")
+        .trim_start_matches("Bearer ")
+        .to_string();
+    if !st.access.contains(&token) {
+        return err(401, "unauthenticated");
+    }
+    if !st.devices_scope {
+        return err(403, "insufficient_scope");
+    }
+    let body = r.json_body().unwrap_or(Value::Null);
+    let device = &body["device"];
+    let (id, pubkey) = (s(device, "id"), s(device, "pubkey"));
+    let ts = body["ts"].as_i64().unwrap_or(0);
+    let (sig, nonce) = (s(&body, "sig"), s(&body, "nonce"));
+    if id.is_empty() || nonce.is_empty() || s(&body, "product").is_empty() {
+        return err(400, "invalid_request");
+    }
+    let message = format!("POST|/v1/device/{op}|{id}|{ts}|{nonce}");
+    let verified = (|| {
+        let key: [u8; 32] = URL_SAFE_NO_PAD.decode(&pubkey).ok()?.try_into().ok()?;
+        let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(&sig).ok()?).ok()?;
+        VerifyingKey::from_bytes(&key)
+            .ok()?
+            .verify(message.as_bytes(), &sig)
+            .ok()
+    })()
+    .is_some();
+    if !verified || !st.used_signatures.insert(sig) {
+        return err(401, "bad_signature");
+    }
+    let account = PERSONAL.to_string();
+    let theirs = |k: &String, a: &String| *k != pubkey || *a != account;
+    if op == "unregister" {
+        return match st.registered_devices.get(&id) {
+            Some((k, a)) if theirs(k, a) => err(409, "device_id_in_use"),
+            Some(_) => {
+                st.registered_devices.remove(&id);
+                reply(200, json!({"unregistered": true}))
+            }
+            None => reply(200, json!({"unregistered": false})),
+        };
+    }
+    if st
+        .registered_devices
+        .get(&id)
+        .is_some_and(|(k, a)| theirs(k, a))
+        || st.devices.get(&id).is_some_and(|k| *k != pubkey)
+    {
+        return err(409, "device_id_in_use");
+    }
+    st.registered_devices
+        .insert(id.clone(), (pubkey, account.clone()));
+    let (name, _) = account_label(st, &account);
+    reply(
+        200,
+        json!({"device_id": id, "account_id": account, "account_name": name, "registered_at": st.time()}),
+    )
 }
 
 /// Whether a redirect host is on the local network: private IPv4, IPv6

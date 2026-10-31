@@ -53,8 +53,9 @@ pub use auth::{
     SignedIn, StaticToken, TokenStore, TwoFactorChallenge,
 };
 pub use cloud::{
-    FeedResponse, MerosAccount, MerosCloud, MerosDoc, MerosDocInfo, MerosDocVersion, MerosFeeds,
-    MerosFile, MerosPack, MerosProfile, canonical_json, content_hash, file_hash, verify_pack,
+    DeviceRegistration, FeedResponse, MerosAccount, MerosCloud, MerosDoc, MerosDocInfo,
+    MerosDocVersion, MerosFeeds, MerosFile, MerosPack, MerosProfile, canonical_json, content_hash,
+    file_hash, verify_pack,
 };
 #[cfg(feature = "entitlement")]
 pub use device::EntitlementDevice;

@@ -467,3 +467,81 @@ async fn password_refusals_come_through_unchanged() {
         .unwrap_err();
     assert_eq!(e.code, "email_not_verified");
 }
+
+// ── Devices registered without a seat ──
+
+#[tokio::test]
+async fn a_registered_device_counts_as_known_until_it_unregisters() {
+    let fake = FakeMeros::new();
+    let a = signed_in(&fake).await;
+    let cloud = cloud(&fake, &a);
+    let device = Arc::new(TestDevice::new("panel-1"));
+    let public = "https://panel.example.com/cb";
+    let e = a
+        .begin_browser_sign_in(&server_options(&device, public))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_redirect_uri");
+
+    let r = cloud
+        .register_device(
+            "example-app",
+            device.as_ref(),
+            Some("Booth"),
+            Some("x86_64"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (r.device_id.as_str(), r.account_id.as_str()),
+        ("panel-1", "acct-personal")
+    );
+    let sent = fake.requests_to("/v1/device/register").pop().unwrap();
+    let body = sent.json_body().unwrap();
+    assert_eq!(body["device"]["name"], "Booth");
+    assert!(body["sig"].as_str().is_some_and(|s| s.len() == 86));
+    a.begin_browser_sign_in(&server_options(&device, public))
+        .await
+        .unwrap();
+
+    // Another key can't take the id.
+    let impostor = TestDevice::with_key("panel-1", "impostor");
+    let e = cloud
+        .register_device("example-app", &impostor, None, None)
+        .await
+        .unwrap_err();
+    assert_eq!((e.status, e.code.as_str()), (Some(409), "device_id_in_use"));
+
+    assert!(
+        cloud
+            .unregister_device("example-app", device.as_ref())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !cloud
+            .unregister_device("example-app", device.as_ref())
+            .await
+            .unwrap()
+    );
+    let e = a
+        .begin_browser_sign_in(&server_options(&device, public))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_redirect_uri");
+}
+
+#[tokio::test]
+async fn registering_needs_the_scope() {
+    let fake = FakeMeros::new();
+    fake.state().devices_scope = false;
+    let a = signed_in(&fake).await;
+    let e = cloud(&fake, &a)
+        .register_device("example-app", &TestDevice::new("p"), None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (e.status, e.code.as_str()),
+        (Some(403), "insufficient_scope")
+    );
+}

@@ -67,6 +67,8 @@ pub struct Outcome {
 /// Every command, for `meros-client commands`.
 pub const COMMANDS: &[&str] = &[
     "device.identity",
+    "device.register",
+    "device.unregister",
     "signin.start",
     "signin.poll",
     "signin.status",
@@ -1002,11 +1004,16 @@ impl Ctx {
     /// The identity this call acts as: `session` (a handle the caller
     /// picks), else the session signed in as `sub`, else `default`.
     fn session(&self) -> Result<String, Error> {
+        self.session_or("default")
+    }
+
+    /// [`session`](Self::session), with another default handle.
+    fn session_or(&self, default: &str) -> Result<String, Error> {
         if let Some(h) = self.opt("session") {
             return Ok(file_safe(&h).replace('.', "_"));
         }
         let Some(sub) = self.opt("sub") else {
-            return Ok("default".into());
+            return Ok(default.into());
         };
         self.sessions()?
             .into_iter()
@@ -1060,8 +1067,12 @@ impl Ctx {
     }
 
     fn auth(&self) -> Result<Arc<MerosAuth>, Error> {
+        self.auth_for(&self.session()?)
+    }
+
+    /// The session `handle`.
+    fn auth_for(&self, handle: &str) -> Result<Arc<MerosAuth>, Error> {
         let state = self.state()?;
-        let handle = self.session()?;
         if !state.read_only {
             create_private_dir(&state.path("sessions")).map_err(state_error)?;
         }
@@ -1145,6 +1156,7 @@ impl Ctx {
                 let d = self.device()?;
                 Ok(json!({"device_id": d.id, "pubkey": d.pubkey()}))
             }
+            "device.register" | "device.unregister" => self.registration(&command[7..]).await,
             c if c.starts_with("signin.") => self.signin(&c[7..]).await,
             c if c.starts_with("server.") => self.server(&c[7..]).await,
             c if c.starts_with("license.") => self.license(&c[8..]).await,
@@ -1240,6 +1252,8 @@ impl Ctx {
             }
             "signout" => {
                 let auth = self.auth()?;
+                let handle = self.session()?;
+                let registration = self.unregister_before_sign_out(&handle, auth.clone()).await;
                 let revoked = auth.sign_out().await;
                 state.remove(pending);
                 let prefix = format!("{}-", self.session()?);
@@ -1250,7 +1264,11 @@ impl Ctx {
                         }
                     }
                 }
-                Ok(json!({"revoked": revoked}))
+                let mut out = json!({"revoked": revoked});
+                if let Some(r) = registration {
+                    out["device_registration"] = r;
+                }
+                Ok(out)
             }
             "list" => Ok(
                 json!({"sessions": self.sessions()?.into_iter().map(|(h, u)| json!({
@@ -1299,6 +1317,86 @@ impl Ctx {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ── Device registration (devices without a license seat) ──
+
+    /// `device.register` and `device.unregister`, as the Server session
+    /// (`session`, default `server`).
+    async fn registration(&self, op: &str) -> Result<Value, Error> {
+        let state = self.state()?;
+        let handle = self.session_or("server")?;
+        let product = self.req("product")?;
+        let device = self.device()?;
+        let auth = self.auth_for(&handle)?;
+        auth.load().await;
+        if !auth.signed_in() {
+            return Err(Error::new(
+                None,
+                "no_sign_in",
+                format!("The {handle} session isn't signed in. Sign the instance in first."),
+            ));
+        }
+        let cloud = MerosCloud::new(self.issuer()?, self.transport.clone(), auth);
+        if op == "register" {
+            let model = self
+                .opt("model")
+                .unwrap_or_else(|| format!("{} {}", std::env::consts::OS, std::env::consts::ARCH));
+            let r = cloud
+                .register_device(
+                    &product,
+                    device.as_ref(),
+                    self.opt("device_name").as_deref(),
+                    Some(&model),
+                )
+                .await?;
+            let out = json!({
+                "device_id": r.device_id,
+                "account_id": r.account_id,
+                "account_name": r.account_name,
+                "registered_at": r.registered_at,
+            });
+            let mut kept = out.clone();
+            kept["session"] = json!(handle);
+            kept["product"] = json!(product);
+            state.write_json(REGISTRATION, &kept)?;
+            Ok(out)
+        } else {
+            let was = cloud.unregister_device(&product, device.as_ref()).await?;
+            state.remove(REGISTRATION);
+            Ok(json!({"unregistered": was}))
+        }
+    }
+
+    /// Before the session that registered this device signs out: removes
+    /// the registration, best effort. None when it registered nothing.
+    async fn unregister_before_sign_out(
+        &self,
+        handle: &str,
+        auth: Arc<MerosAuth>,
+    ) -> Option<Value> {
+        let state = self.state().ok()?;
+        let kept = state.read_json(REGISTRATION)?;
+        if kept["session"].as_str() != Some(handle) {
+            return None;
+        }
+        let product = kept["product"].as_str().unwrap_or_default().to_string();
+        let device = match self.device() {
+            Ok(d) => d,
+            Err(e) => return Some(json!({"unregistered": false, "error": e.message})),
+        };
+        let issuer = self.issuer().ok()?;
+        let cloud = MerosCloud::new(issuer, self.transport.clone(), auth);
+        Some(
+            match cloud.unregister_device(&product, device.as_ref()).await {
+                Ok(_) => {
+                    state.remove(REGISTRATION);
+                    json!({"unregistered": true})
+                }
+                // Kept, so device.unregister can try again after signing in.
+                Err(e) => json!({"unregistered": false, "error": e.message}),
+            },
+        )
     }
 
     // ── Sign in with Meros (browser and password) ──
@@ -2346,6 +2444,10 @@ fn parse_rfc3339(t: &str) -> Option<i64> {
 
 /// `s` as a file-name part: anything but letters, digits, `.`, `_` and `-`
 /// becomes `_`.
+/// Where `device.register` keeps the registration and the session that
+/// made it.
+const REGISTRATION: &str = "device-registration.json";
+
 /// Checks a browser sign-in's redirect: absolute, with no fragment or
 /// userinfo; https, or plain http to a loopback address for a desktop app.
 /// Returns whether it is a loopback redirect.
