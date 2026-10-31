@@ -1453,3 +1453,304 @@ fn fake_mode_runs_the_real_binary_with_no_network() {
         .unwrap();
     assert_eq!(out.status.code(), Some(exit::USAGE));
 }
+
+// ── Sign in with Meros: browser and password ──
+
+const SERVER_CALLBACK: &str = "https://rack.lan:8443/auth/meros/callback";
+
+fn query_of(url: &str) -> std::collections::HashMap<String, String> {
+    url::Url::parse(url)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_server_signs_people_in_through_the_browser_one_session_each() {
+    let env = Env::new();
+    let b = env
+        .ok(
+            "signin.browser.begin",
+            json!({"redirect_uri": SERVER_CALLBACK}),
+        )
+        .await;
+    // Pushed and signed with the instance's key.
+    assert_eq!(env.fake.requests_to("/oauth/par").len(), 1);
+    let url = b["authorize_url"].as_str().unwrap();
+    assert!(url.contains("request_uri=") && !url.contains("code_challenge"));
+    let callback = env.fake.approve(url);
+    let done = env
+        .ok("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+    assert_eq!(done["status"], "signed_in");
+    assert_eq!(done["session"], "user-u1");
+    assert_eq!(done["user"]["id"], "u1");
+    assert_eq!(done["amr"], json!(["pwd"]));
+    // The same person again lands in the same session; calls act as them
+    // with `sub`.
+    let b = env
+        .ok(
+            "signin.browser.begin",
+            json!({"redirect_uri": SERVER_CALLBACK}),
+        )
+        .await;
+    let callback = env.fake.approve(b["authorize_url"].as_str().unwrap());
+    let q = query_of(&callback);
+    let again = env
+        .ok(
+            "signin.browser.finish",
+            json!({"code": q["code"], "state": q["state"], "iss": q["iss"]}),
+        )
+        .await;
+    assert_eq!(again["session"], "user-u1");
+    let list = env.ok("signin.list", json!({})).await;
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        env.ok("signin.status", json!({"sub": "u1"})).await["signed_in"],
+        true
+    );
+    // Nothing is left waiting.
+    let (code, err) = env
+        .refused("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+    assert_eq!((code, err.as_str()), (exit::LOCAL, "unknown_request"));
+}
+
+#[tokio::test]
+async fn the_instance_signs_in_as_the_server_client_for_activation() {
+    let env = Env::new();
+    env.fake
+        .state()
+        .server_keys
+        .insert("SRV-1".into(), PERSONAL.into());
+    let begin = json!({
+        "client": "server",
+        "server_client_id": "server-client",
+        "redirect_uri": SERVER_CALLBACK,
+    });
+    let b = env.ok("signin.browser.begin", begin).await;
+    let callback = env.fake.approve(b["authorize_url"].as_str().unwrap());
+    let done = env
+        .ok("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+    assert_eq!(done["session"], "server");
+    let a = env
+        .ok("server.activate_login", json!({"session": "server"}))
+        .await;
+    assert_eq!(a["licence"]["account_id"], PERSONAL);
+    // The session refreshes as the server client.
+    env.ok("signin.token", json!({"session": "server", "force": true}))
+        .await;
+    let refresh = env.fake.requests_to("/oauth/token").pop().unwrap();
+    let f: std::collections::HashMap<String, String> = refresh.form_fields().into_iter().collect();
+    assert_eq!(f["client_id"], "server-client");
+    // The server client must be named.
+    let (code, err) = env
+        .refused(
+            "signin.browser.begin",
+            json!({"client": "server", "redirect_uri": SERVER_CALLBACK}),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (exit::USAGE, "bad_input"));
+}
+
+#[tokio::test]
+async fn a_redirect_must_be_https_or_loopback() {
+    let env = Env::new();
+    for bad in [
+        "http://rack.lan/cb",
+        "https://rack.lan/cb#x",
+        "https://user@rack.lan/cb",
+        "rack.lan/cb",
+    ] {
+        let (code, err) = env
+            .refused("signin.browser.begin", json!({"redirect_uri": bad}))
+            .await;
+        assert_eq!((code, err.as_str()), (exit::USAGE, "bad_input"), "{bad}");
+    }
+    // A loopback redirect is a desktop app's: not pushed.
+    let b = env
+        .ok(
+            "signin.browser.begin",
+            json!({"redirect_uri": "http://127.0.0.1:51234/callback", "login_hint": "pat@example.com"}),
+        )
+        .await;
+    assert!(env.fake.requests_to("/oauth/par").is_empty());
+    let q = query_of(b["authorize_url"].as_str().unwrap());
+    assert!(q.contains_key("code_challenge"));
+    assert_eq!(q["login_hint"], "pat@example.com");
+    // The service's refusal comes through.
+    let (code, err) = env
+        .refused(
+            "signin.browser.begin",
+            json!({"redirect_uri": "https://rack.example.com/cb"}),
+        )
+        .await;
+    assert_eq!(
+        (code, err.as_str()),
+        (exit::REFUSED, "invalid_redirect_uri")
+    );
+}
+
+#[tokio::test]
+async fn loopback_waits_for_the_browser_and_finishes() {
+    let env = Env::new();
+    let browser = async {
+        // The page to open, as the helper also writes it to stderr.
+        let file = env.state_file("signin/loopback.json");
+        let url = loop {
+            if let Ok(text) = std::fs::read_to_string(&file)
+                && let Ok(v) = serde_json::from_str::<Value>(&text)
+            {
+                break v["authorize_url"].as_str().unwrap().to_string();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let callback = env.fake.approve(&url);
+        let target = callback.trim_start_matches("http://");
+        let (addr, path) = target.split_at(target.find('/').unwrap());
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut page = String::new();
+        s.read_to_string(&mut page).await.unwrap();
+        assert!(page.contains("close this window"));
+    };
+    let (done, ()) = tokio::join!(
+        env.ok(
+            "signin.browser.loopback",
+            json!({"open": false, "timeout_s": 20})
+        ),
+        browser
+    );
+    assert_eq!(done["session"], "user-u1");
+    assert!(!env.state_file("signin/loopback.json").exists());
+    let (code, err) = env
+        .refused(
+            "signin.browser.loopback",
+            json!({"open": false, "timeout_s": 1}),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (exit::REFUSED, "timeout"));
+}
+
+#[tokio::test]
+async fn a_console_signs_in_with_a_password_and_a_code() {
+    let env = Env::new();
+    {
+        let mut st = env.fake.state();
+        st.credentials = Some(("pat@example.com".into(), "correct horse".into()));
+        st.totp = Some("123456".into());
+    }
+    let step = env
+        .ok(
+            "signin.password",
+            json!({"email": "pat@example.com", "password": "correct horse", "session": "panel"}),
+        )
+        .await;
+    assert_eq!(step["status"], "two_factor");
+    let challenge = step["challenge"].clone();
+    let (code, err) = env
+        .refused(
+            "signin.password.two_factor",
+            json!({"challenge": challenge, "code": "000000"}),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (exit::REFUSED, "bad_code"));
+    let done = env
+        .ok(
+            "signin.password.two_factor",
+            json!({"challenge": challenge, "code": "123456"}),
+        )
+        .await;
+    assert_eq!(done["session"], "panel");
+    assert_eq!(done["amr"], json!(["pwd", "otp", "mfa"]));
+    // The password is kept nowhere.
+    fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            if e.path().is_dir() {
+                files(&e.path(), out);
+            } else {
+                out.push(e.path());
+            }
+        }
+    }
+    let mut all = Vec::new();
+    files(&env.state_file(""), &mut all);
+    for f in all {
+        let text = String::from_utf8_lossy(&std::fs::read(&f).unwrap()).to_string();
+        assert!(!text.contains("correct horse"), "{}", f.display());
+    }
+    let (code, err) = env
+        .refused(
+            "signin.password.two_factor",
+            json!({"challenge": challenge, "code": "123456"}),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (exit::LOCAL, "unknown_request"));
+    let (code, err) = env
+        .refused(
+            "signin.password",
+            json!({"email": "pat@example.com", "password": "nope"}),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (exit::REFUSED, "bad_credentials"));
+}
+
+#[tokio::test]
+async fn fake_mode_answers_the_sign_in_page_and_approves_loopback_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = json!({
+        "state_dir": dir.path().join("state").to_str().unwrap(),
+        "issuer": "fake:",
+        "client_id": "client-1",
+        "scopes": "openid offline_access",
+    });
+    let call = |command: &str, extra: Value| {
+        let mut input = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            input[k] = v.clone();
+        }
+        let command = command.to_string();
+        async move { cli::run(&command, input, FakeMeros::new()).await }
+    };
+    let b = call(
+        "signin.browser.begin",
+        json!({"redirect_uri": SERVER_CALLBACK}),
+    )
+    .await;
+    assert_eq!(b.exit, exit::OK, "{}", b.output);
+    let page = call(
+        "fake.authorize",
+        json!({"authorize_url": b.output["authorize_url"]}),
+    )
+    .await;
+    assert_eq!(page.exit, exit::OK, "{}", page.output);
+    let done = call(
+        "signin.browser.finish",
+        json!({"callback_url": page.output["callback_url"]}),
+    )
+    .await;
+    assert_eq!(done.output["session"], "user-u1", "{}", done.output);
+    let lb = call("signin.browser.loopback", json!({"open": false})).await;
+    assert_eq!(lb.output["status"], "signed_in", "{}", lb.output);
+    let denied = call(
+        "signin.browser.begin",
+        json!({"redirect_uri": SERVER_CALLBACK}),
+    )
+    .await;
+    let page = call(
+        "fake.authorize",
+        json!({"authorize_url": denied.output["authorize_url"], "deny": true}),
+    )
+    .await;
+    let e = call(
+        "signin.browser.finish",
+        json!({"callback_url": page.output["callback_url"]}),
+    )
+    .await;
+    assert_eq!(e.output["error"]["code"], "access_denied");
+}

@@ -34,11 +34,11 @@ use serde_json::{Map, Value, json};
 use crate::events::{Actor, Collector, Emitter, EmitterConfig, Envelope, Event, Severity, Subject};
 use crate::http::{BoxFuture, unix_now};
 use crate::{
-    AccessTokenSource, AccountSupportApi, AuthConfig, DeviceIdentity, DeviceSignIn, DeviceSigner,
-    Error, FeedResponse, LicenseClient, LicenseConfig, LicenseDevice, MerosAuth, MerosCloud,
-    MerosFeeds, MerosUser, ServerConfig, ServerDevice, ServerLicenseClient, ServerRenewal,
-    SignInClaim, SupportApi, SupportThread, SupportTicket, TokenStore, Transport, verify_licence,
-    verify_pack,
+    AccessTokenSource, AccountSupportApi, AuthConfig, BrowserSignInOptions, DeviceIdentity,
+    DeviceSignIn, DeviceSigner, Error, FeedResponse, LicenseClient, LicenseConfig, LicenseDevice,
+    MerosAuth, MerosCloud, MerosFeeds, MerosUser, NewSession, PasswordStep, ServerConfig,
+    ServerDevice, ServerLicenseClient, ServerRenewal, SignInClaim, SupportApi, SupportThread,
+    SupportTicket, TokenStore, Transport, verify_licence, verify_pack,
 };
 
 /// Exit codes.
@@ -77,6 +77,11 @@ pub const COMMANDS: &[&str] = &[
     "signin.redeem.begin",
     "signin.redeem.complete",
     "signin.login_token",
+    "signin.browser.begin",
+    "signin.browser.finish",
+    "signin.browser.loopback",
+    "signin.password",
+    "signin.password.two_factor",
     "server.activate",
     "server.activate_login",
     "server.renew",
@@ -123,6 +128,7 @@ pub const COMMANDS: &[&str] = &[
     "fake.keys",
     "fake.state",
     "fake.set",
+    "fake.authorize",
     "fake.approve_device",
     "fake.deny_device",
     "fake.publish_pack",
@@ -185,7 +191,8 @@ pub async fn run(command: &str, input: Value, transport: Arc<dyn Transport>) -> 
         Some((f, _)) => f.clone(),
         None => transport,
     };
-    let ctx = match Ctx::open(input, transport, READ_ONLY.contains(&command)) {
+    let fake_service = fake.as_ref().map(|(f, _)| f.clone());
+    let ctx = match Ctx::open(input, transport, fake_service, READ_ONLY.contains(&command)) {
         Ok(c) => c,
         Err(e) => return failure(e),
     };
@@ -308,6 +315,13 @@ fn fake_command(
             st.mint = mint;
             st.requests = requests;
             Ok(json!({}))
+        }
+        "fake.authorize" => {
+            let approved = input.get("deny").and_then(|v| v.as_bool()) != Some(true);
+            let callback = fake
+                .authorize(&text("authorize_url")?, approved)
+                .map_err(|e| bad_input(format!("The fake can't answer that: {e}.")))?;
+            Ok(json!({"callback_url": callback}))
         }
         "fake.approve_device" | "fake.deny_device" => {
             let code = text("user_code")?;
@@ -818,6 +832,10 @@ impl DeviceSigner for FileDevice {
         let input = format!("{method}|{path}|{}|{ts}", self.id);
         Some(URL_SAFE_NO_PAD.encode(self.key.sign(input.as_bytes()).to_bytes()))
     }
+
+    fn sign_message(&self, message: &str) -> Option<String> {
+        Some(URL_SAFE_NO_PAD.encode(self.key.sign(message.as_bytes()).to_bytes()))
+    }
 }
 
 impl ServerDevice for FileDevice {
@@ -881,12 +899,15 @@ struct Ctx {
     input: Map<String, Value>,
     transport: Arc<dyn Transport>,
     state: Option<Arc<State>>,
+    /// The fake service in fake mode.
+    fake: Option<Arc<crate::fake::FakeMeros>>,
 }
 
 impl Ctx {
     fn open(
         input: Map<String, Value>,
         transport: Arc<dyn Transport>,
+        fake: Option<Arc<crate::fake::FakeMeros>>,
         read_only: bool,
     ) -> Result<Ctx, Error> {
         let key_file = input
@@ -904,6 +925,7 @@ impl Ctx {
             input,
             transport,
             state,
+            fake,
         })
     }
 
@@ -1025,25 +1047,29 @@ impl Ctx {
         Ok(out)
     }
 
-    fn auth(&self) -> Result<Arc<MerosAuth>, Error> {
-        let state = self.state()?;
-        let handle = self.session()?;
-        if !state.read_only {
-            create_private_dir(&state.path("sessions")).map_err(state_error)?;
-        }
-        let scopes = match self.input.get("scopes") {
+    /// `scopes`, an array or a space-separated string.
+    fn scopes(&self) -> Vec<String> {
+        match self.input.get("scopes") {
             Some(Value::Array(a)) => a
                 .iter()
                 .filter_map(|s| s.as_str().map(str::to_string))
                 .collect(),
             Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
             _ => Vec::new(),
-        };
+        }
+    }
+
+    fn auth(&self) -> Result<Arc<MerosAuth>, Error> {
+        let state = self.state()?;
+        let handle = self.session()?;
+        if !state.read_only {
+            create_private_dir(&state.path("sessions")).map_err(state_error)?;
+        }
         let config = AuthConfig {
             issuer: self.issuer()?,
             client_id: self.opt("client_id").unwrap_or_default(),
             redirect_uri: String::new(),
-            scopes,
+            scopes: self.scopes(),
         };
         let store = Arc::new(FileTokenStore::open(
             state.clone(),
@@ -1257,6 +1283,9 @@ impl Ctx {
                     .await?;
                 Ok(json!({"user": user_json(&user), "replaced_previous": replaced}))
             }
+            op if op.starts_with("browser.") || op.starts_with("password") => {
+                self.person_signin(op).await
+            }
             "login_token" => {
                 let cloud = self.cloud().await?;
                 cloud
@@ -1267,6 +1296,273 @@ impl Ctx {
                         self.opt("acr_values").as_deref(),
                     )
                     .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ── Sign in with Meros (browser and password) ──
+
+    /// The client a sign-in uses: `client` `browser` (the default: people,
+    /// `client_id`) or `server` (the instance itself, `server_client_id`,
+    /// the only one allowed `licenses:activate`).
+    fn sign_in_client(&self) -> Result<(String, String), Error> {
+        match self.opt("client").as_deref().unwrap_or("browser") {
+            "browser" => Ok(("browser".into(), self.req("client_id")?)),
+            "server" => Ok(("server".into(), self.req("server_client_id")?)),
+            other => Err(bad_input(format!(
+                "`client` is `browser` or `server`, not `{other}`."
+            ))),
+        }
+    }
+
+    /// Where a new sign-in goes: `session`, else `server` for the server
+    /// client and `by_user` (one session per person) for people.
+    fn sign_in_target(&self, kind: &str) -> String {
+        match self.opt("session") {
+            Some(s) if s == "by_user" => s,
+            Some(s) => file_safe(&s).replace('.', "_"),
+            None if kind == "server" => "server".into(),
+            None => "by_user".into(),
+        }
+    }
+
+    /// The session a completed sign-in is kept in: `target`, or with
+    /// `by_user` the session already signed in as that person, else a new
+    /// `user-{sub}`.
+    fn session_for(&self, target: &str, user: &MerosUser) -> Result<String, Error> {
+        if target != "by_user" {
+            return Ok(target.to_string());
+        }
+        if let Some((h, _)) = self
+            .sessions()?
+            .into_iter()
+            .find(|(_, u)| u.as_ref().is_some_and(|u| u.id == user.id))
+        {
+            return Ok(h);
+        }
+        let sub: String = user
+            .id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
+        Ok(format!("user-{sub}"))
+    }
+
+    /// A MerosAuth over the session `handle`, as `client_id`.
+    fn auth_as(&self, client_id: &str, store: &str) -> Result<Arc<MerosAuth>, Error> {
+        let state = self.state()?;
+        create_private_dir(&state.path("sessions")).map_err(state_error)?;
+        create_private_dir(&state.path("signin")).map_err(state_error)?;
+        let config = AuthConfig {
+            issuer: self.issuer()?,
+            client_id: client_id.to_string(),
+            redirect_uri: String::new(),
+            scopes: self.scopes(),
+        };
+        let store = Arc::new(FileTokenStore::open(state, store.to_string())?);
+        Ok(Arc::new(
+            MerosAuth::new(config, self.transport.clone(), store).keep_access_token(),
+        ))
+    }
+
+    /// The browser sign-ins waiting for their callbacks, kept apart from
+    /// any session: which session one lands in is known only when it
+    /// finishes.
+    fn pending_auth(&self, client_id: &str) -> Result<Arc<MerosAuth>, Error> {
+        self.auth_as(client_id, "signin/pending.json")
+    }
+
+    /// Keeps a finished sign-in in its session and describes it.
+    async fn keep_sign_in(&self, s: NewSession, target: &str) -> Result<Value, Error> {
+        let handle = self.session_for(target, &s.user)?;
+        // The session file refreshes with the client the tokens belong to.
+        let auth = self.auth_as(
+            &self.opt("client_id").unwrap_or_else(|| s.client_id.clone()),
+            &format!("sessions/{handle}.json"),
+        )?;
+        let kept = auth.adopt(s).await;
+        Ok(json!({
+            "status": "signed_in",
+            "session": handle,
+            "user": user_json(&kept.user),
+            "replaced_previous": kept.replaced_previous,
+            "acr": kept.acr,
+            "amr": kept.amr,
+        }))
+    }
+
+    fn browser_options(&self, redirect_uri: String) -> BrowserSignInOptions {
+        BrowserSignInOptions {
+            redirect_uri,
+            acr_values: self.opt("acr_values"),
+            login_hint: self.opt("login_hint"),
+            prompt: self.opt("prompt"),
+            device: None,
+            context: None,
+        }
+    }
+
+    async fn person_signin(&self, op: &str) -> Result<Value, Error> {
+        match op {
+            "browser.begin" => {
+                let redirect = self.req("redirect_uri")?;
+                let loopback = check_redirect(&redirect)?;
+                let (kind, client) = self.sign_in_client()?;
+                let target = self.sign_in_target(&kind);
+                let mut options = self.browser_options(redirect);
+                options.context = Some(json!({"session": target, "client": kind}).to_string());
+                // Server products push their sign-ins, signed with the
+                // instance's key; a loopback redirect is a desktop app's.
+                let par = match self.input.get("par") {
+                    Some(Value::Bool(b)) => *b,
+                    _ => !loopback,
+                };
+                if par {
+                    options.device = Some(self.device()?);
+                }
+                let b = self
+                    .pending_auth(&client)?
+                    .begin_browser_sign_in(&options)
+                    .await?;
+                Ok(json!({
+                    "authorize_url": b.authorize_url,
+                    "state": b.state,
+                    "expires_at": b.expires_at,
+                }))
+            }
+            "browser.finish" => {
+                let callback = match self.opt("callback_url") {
+                    Some(c) => c,
+                    None => {
+                        // The parts the caller took from its own callback.
+                        let mut u = url::Url::parse("https://callback.invalid/").unwrap();
+                        {
+                            let mut q = u.query_pairs_mut();
+                            for k in ["code", "state", "iss", "error", "error_description"] {
+                                if let Some(v) = self.opt(k) {
+                                    q.append_pair(k, &v);
+                                }
+                            }
+                        }
+                        if self.opt("state").is_none() {
+                            return Err(bad_input("Give `callback_url`, or `code` and `state`."));
+                        }
+                        u.to_string()
+                    }
+                };
+                let client = self.opt("client_id").unwrap_or_default();
+                let s = self
+                    .pending_auth(&client)?
+                    .finish_browser_sign_in(&callback)
+                    .await?;
+                let ctx: Value = s
+                    .context
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or(Value::Null);
+                let target = ctx["session"].as_str().unwrap_or("by_user").to_string();
+                self.keep_sign_in(s, &target).await
+            }
+            "browser.loopback" => {
+                let (kind, client) = self.sign_in_client()?;
+                let target = self.sign_in_target(&kind);
+                let listener = crate::loopback::LoopbackRedirect::bind().await?;
+                let options = self.browser_options(listener.redirect_uri().to_string());
+                let pending = self.pending_auth(&client)?;
+                let b = pending.begin_browser_sign_in(&options).await?;
+                let state = self.state()?;
+                state.write_json(
+                    "signin/loopback.json",
+                    &json!({"authorize_url": b.authorize_url, "expires_at": b.expires_at}),
+                )?;
+                let timeout = self.opt_i64("timeout_s")?.unwrap_or(300).clamp(1, 3600) as u64;
+                let callback = if let Some(fake) = &self.fake {
+                    // The fake's browser approves at once.
+                    fake.authorize(&b.authorize_url, true)
+                        .map_err(|e| state_error(format!("fake: {e}")))?
+                } else {
+                    eprintln!("{}", json!({"authorize_url": b.authorize_url}));
+                    if self.input.get("open").and_then(|v| v.as_bool()) != Some(false) {
+                        open_browser(&b.authorize_url);
+                    }
+                    let waited = listener.wait(std::time::Duration::from_secs(timeout)).await;
+                    state.remove("signin/loopback.json");
+                    waited?
+                };
+                state.remove("signin/loopback.json");
+                let s = pending.finish_browser_sign_in(&callback).await?;
+                self.keep_sign_in(s, &target).await
+            }
+            "password" => {
+                let (kind, client) = self.sign_in_client()?;
+                let target = self.sign_in_target(&kind);
+                let device = self.device()?;
+                let auth = self.pending_auth(&client)?;
+                let step = auth
+                    .password_sign_in(device.as_ref(), &self.req("email")?, &self.req("password")?)
+                    .await?;
+                match step {
+                    PasswordStep::SignedIn(s) => self.keep_sign_in(s, &target).await,
+                    PasswordStep::TwoFactor(c) => {
+                        // Where the sign-in goes once the code is in.
+                        let state = self.state()?;
+                        let mut waiting = state
+                            .read_json("signin/two_factor.json")
+                            .unwrap_or_else(|| json!({}));
+                        let now = unix_now();
+                        if let Some(m) = waiting.as_object_mut() {
+                            m.retain(|_, v| v["expires_at"].as_i64().is_some_and(|e| e > now));
+                            m.insert(
+                                c.challenge.clone(),
+                                json!({"session": target, "client": client, "expires_at": c.expires_at}),
+                            );
+                        }
+                        state.write_json("signin/two_factor.json", &waiting)?;
+                        Ok(json!({
+                            "status": "two_factor",
+                            "challenge": c.challenge,
+                            "methods": c.methods,
+                            "expires_at": c.expires_at,
+                        }))
+                    }
+                }
+            }
+            "password.two_factor" => {
+                let challenge = self.req("challenge")?;
+                let state = self.state()?;
+                let mut waiting = state
+                    .read_json("signin/two_factor.json")
+                    .unwrap_or_else(|| json!({}));
+                let entry = waiting[&challenge].clone();
+                let Some(client) = entry["client"].as_str().map(str::to_string) else {
+                    return Err(Error::new(
+                        None,
+                        "unknown_request",
+                        "This two-factor step was not begun here, or it expired. Sign in again.",
+                    ));
+                };
+                let target = entry["session"].as_str().unwrap_or("by_user").to_string();
+                let device = self.device()?;
+                let result = self
+                    .pending_auth(&client)?
+                    .two_factor_sign_in(device.as_ref(), &challenge, &self.req("code")?)
+                    .await;
+                // A wrong code may be tried again; anything else ends it.
+                if !matches!(&result, Err(e) if e.code == "bad_code" || e.offline()) {
+                    if let Some(m) = waiting.as_object_mut() {
+                        m.remove(&challenge);
+                    }
+                    state.write_json("signin/two_factor.json", &waiting)?;
+                }
+                self.keep_sign_in(result?, &target).await
             }
             _ => unreachable!(),
         }
@@ -2050,6 +2346,54 @@ fn parse_rfc3339(t: &str) -> Option<i64> {
 
 /// `s` as a file-name part: anything but letters, digits, `.`, `_` and `-`
 /// becomes `_`.
+/// Checks a browser sign-in's redirect: absolute, with no fragment or
+/// userinfo; https, or plain http to a loopback address for a desktop app.
+/// Returns whether it is a loopback redirect.
+fn check_redirect(uri: &str) -> Result<bool, Error> {
+    let u =
+        url::Url::parse(uri).map_err(|_| bad_input("`redirect_uri` must be an absolute URL."))?;
+    if u.fragment().is_some() || !u.username().is_empty() || u.password().is_some() {
+        return Err(bad_input(
+            "`redirect_uri` may have no fragment or userinfo.",
+        ));
+    }
+    let loopback = match u.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    match u.scheme() {
+        "https" => Ok(loopback),
+        "http" if loopback => Ok(true),
+        _ => Err(bad_input(
+            "`redirect_uri` must be https, or http to a loopback address.",
+        )),
+    }
+}
+
+/// Opens `url` in the system browser, best effort.
+fn open_browser(url: &str) {
+    let mut command = if cfg!(windows) {
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let _ = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn file_safe(s: &str) -> String {
     s.chars()
         .map(|c| {

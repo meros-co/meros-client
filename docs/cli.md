@@ -89,12 +89,13 @@ settings on every call, and add the command's own fields.
 | `issuer` | service calls | The service origin, e.g. the staging or production one. No trailing slash needed. Nothing is built in. `fake:` runs against a fake service instead (see Fake mode) |
 | `product` | server, cloud, support, events | The product id |
 | `app_name`, `app_version` | licensing, events | Used in the default device name and reported to the service |
-| `client_id`, `scopes` | sign-in | The app's public OAuth client and the scopes it asks for (array or space-separated string). Server activation with a login needs `licenses:activate`; refresh tokens need `offline_access` |
+| `client_id`, `scopes` | sign-in | The product's public OAuth client for people and the scopes it asks for (array or space-separated string). Refresh tokens need `offline_access` |
+| `server_client_id` | server sign-in | A server product's client for the instance itself, the only one allowed `licenses:activate` (see Clients and sessions) |
 | `keys` | licensing | The product's signing keys, `{"kid": "base64url Ed25519 public key"}`. Statements and tokens are verified against them before they're stored or reported |
 | `device_base_url` | device licensing, device support | The product's device base. Default `{issuer}/app/{product}`, where Meros serves both |
 | `model`, `device_name` | licensing | How the device appears on the service. `model` defaults to the OS and architecture |
 | `account_id` | cloud, server login | A team account; omitted means the user's default |
-| `session` | sign-in, cloud, server login, account support, events | Which identity to act as: a handle the caller picks (letters, digits, `_`, `-`). Default `default` |
+| `session` | sign-in, cloud, server login, account support, events | Which identity to act as: a handle the caller picks (letters, digits, `_`, `-`). Default `default`; a new browser or password sign-in defaults to one session per person (see Clients and sessions) |
 | `sub` | the same | Act as whichever session is signed in as this subject, instead of naming the `session` |
 | `key_file` | all | Seal every stored file with the key in this file (below). Made on first use; must be outside the state directory |
 
@@ -105,6 +106,7 @@ settings on every call, and add the command's own fields.
 | `device.json` | The device id and its Ed25519 key seed. Made on first use; never sent anywhere except as signatures and the public key |
 | `sessions/{session}.json` | One identity's Sign in with Meros session: refresh token, user, current access token, and login-token requests waiting to be redeemed |
 | `sessions/{session}.signin.json` | That identity's device sign-in in progress |
+| `signin/` | Browser sign-ins waiting for their callbacks, two-factor steps waiting for their codes, and the page a loopback sign-in is waiting on |
 | `server.json` | The Server statement and its feature token |
 | `license.json` | The device entitlement token |
 | `events/` | The local event log, the install's identity, and undelivered events (`outbox.json`) |
@@ -144,9 +146,8 @@ start, which unattended devices can't have.
 
 ### Several identities
 
-Each `session` handle is one identity, with its own client id and scopes
-(passed on each call), its own rotating refresh token, and its own pending
-device grant. A console can keep its own session and any number of people's
+Each `session` handle is one identity, with its own client and scopes, its
+own rotating refresh token, and its own pending device grant. A console can keep its own session and any number of people's
 sessions side by side. Sessions never appear in anything the app exports:
 they live only in the state directory.
 
@@ -167,9 +168,143 @@ result.
 
 Returns `{device_id, pubkey}` and makes the key on first use.
 
-## Sign in with Meros (device grant)
+## Sign in with Meros
 
-For devices without a browser. The person approves a code on another device.
+How a person signs in depends on where the product runs:
+
+| Product | Sign-in | Commands |
+|---|---|---|
+| A server with a web UI | The browser goes to meros.co's sign-in page and comes back to the server | `signin.browser.begin`, `signin.browser.finish` |
+| A desktop app | The same, back to a loopback address the helper listens on | `signin.browser.loopback` |
+| A console without easy typing | Email and password on the console, two-factor included; a code approved on another device as the alternative | `signin.password`, `signin.password.two_factor`; `signin.start`, `signin.poll` |
+
+Browser sign-ins are authorization code with PKCE (S256), a nonce and a
+single-use state. Every sign-in's id_token must be for the client, carry
+the sign-in's nonce and a subject, be unexpired and come from the issuer,
+and a refresh token must come with it. Otherwise the tokens are revoked and
+the call exits 1 with `invalid_response`.
+
+### Clients and sessions
+
+- `client` picks the OAuth client:
+  - `browser` (the default) is the product's client for people, `client_id`;
+  - `server` is the instance's own client, `server_client_id`. It's the only
+    one allowed `licenses:activate`, so a server signs itself in with it for
+    `server.activate_login`.
+- `session` picks where the sign-in is kept. By default:
+  - for people, `by_user`: one session per person, the one already signed in
+    as that `sub`, else a new `user-{sub}`. Later calls act as them with
+    `sub`;
+  - for the server client, `server`.
+
+  Any other handle is used as given.
+- A session refreshes and revokes with the client its tokens belong to,
+  whatever `client_id` a later call passes.
+
+### `signin.browser.begin`
+
+For servers. Input:
+- `redirect_uri`: the server's callback, built from the address the browser
+  used to reach it, such as `https://rack.lan:8443/auth/meros/callback`.
+  It must be https with no fragment or userinfo, or plain http to a loopback
+  address;
+- optional `client`, `session`, `scopes`;
+- optional `acr_values` (`urn:meros:acr:mfa` for a two-factor sign-in),
+  `login_hint` (the email to fill in) and `prompt` (`login` to ask for the
+  password again).
+
+Returns `{authorize_url, state, expires_at}`. Set a short-lived cookie with
+`state` and redirect the browser to `authorize_url`. Up to 32 sign-ins wait
+at once, each for ten minutes; the oldest goes first.
+
+An https redirect is pushed to meros.co first (RFC 9126), signed with the
+instance's device key. The authorize URL then carries only the client and a
+single-use `request_uri` that lasts 90 seconds, so the redirect never comes
+from the browser. meros.co checks the redirect:
+- https only, exact, no public IP address;
+- an instance holding an active license for the product may use local
+  hosts and public DNS names;
+- an instance not activated yet (signing in for `server.activate_login`)
+  may use local-network hosts only: private IPv4, IPv6 ULA, `.local`,
+  `.lan`, `.internal`, `.home.arpa` and single-label names.
+
+Refusals include `invalid_redirect_uri`, `unauthorized_client`,
+`bad_signature` and `rate_limited`. `"par": false` sends the parameters on
+the authorize URL instead, for an issuer or client without pushed requests.
+
+### `signin.browser.finish`
+
+When the browser comes back, check the cookie against `state`, then pass
+the full `callback_url` (or `code`, `state` and `iss` from it, plus `error`
+when there is one). The helper checks:
+- the state is waiting here (each finishes once);
+- `iss` is the issuer (RFC 9207), required when the issuer says it sends it;
+- the code exchanges with the stored verifier and redirect;
+- the id_token, as above.
+
+Returns:
+
+```json
+{"status": "signed_in", "session": "user-u1",
+ "user": {"id": "u1", "name": "Pat", "email": "pat@example.com"},
+ "replaced_previous": false, "acr": "urn:meros:acr:pwd", "amr": ["pwd"]}
+```
+
+Refusals: the issuer's `error` (`access_denied` when the person canceled),
+exit 4 `unknown_request` (not begun here, expired or already finished),
+`issuer_mismatch`, `state_mismatch`, `invalid_grant` and `invalid_response`.
+Offline, the sign-in keeps waiting, so the call can be retried.
+
+### `signin.browser.loopback`
+
+For desktop apps: one call that signs in through the browser.
+1. It listens on `http://127.0.0.1:{free port}/callback`.
+2. It opens the system browser at meros.co's sign-in page, unless
+   `"open": false`.
+3. It waits up to `timeout_s` seconds (default 300) for the browser to come
+   back.
+4. It finishes as `signin.browser.finish` does, and returns the same result.
+
+The page to open is also written to stderr as `{"authorize_url": …}`, and
+to `signin/loopback.json` while the call waits, for apps that show it
+themselves. Input: optional `client`, `session`, `scopes`, `acr_values`,
+`login_hint` and `prompt`. Exit 1 `timeout` when the browser doesn't come
+back in time.
+
+### `signin.password`
+
+For consoles. Input: `email` and `password`, plus optional `client`,
+`session` and `scopes`. The request is signed with the device key, and the
+client must be allowed the password grant.
+
+Pass the password in the stdin JSON only, never in arguments or the
+environment. The helper sends it once and never stores or logs it.
+
+Returns the same result as `signin.browser.finish`, or, when the account
+has two-factor on:
+
+```json
+{"status": "two_factor", "challenge": "…", "methods": ["totp", "recovery"],
+ "expires_at": 1792239000}
+```
+
+Refusals: `bad_credentials` (one message for an unknown email and a wrong
+password), `email_not_verified`, `team_requires_two_factor`,
+`account_locked` (status 423, after ten failures in 15 minutes),
+`rate_limited`, `unauthorized_client` and `bad_signature`.
+
+### `signin.password.two_factor`
+
+Input: `challenge` and `code` (an authenticator code or a recovery code;
+spaces are ignored). Returns the signed-in result. `bad_code` may be tried
+again, up to five tries; `invalid_challenge` and exit 4 `unknown_request`
+mean signing in again.
+
+### Signing in with a code (consoles only)
+
+The device authorization grant (RFC 8628) stays for consoles where typing
+is hard, as the alternative to the password. The person approves a code on
+another device.
 
 ### `signin.start`
 
@@ -295,8 +430,9 @@ Codes include `unknown_license_key`, `license_key_disabled`,
 
 ### `server.activate_login`
 
-Activates with the signed-in user's license, through the device grant
-above. Input: optional `account_id` and `device_name`. Call it after every
+Activates with the signed-in user's license. Sign the instance in with the
+server client first (`signin.browser.begin` with `"client": "server"`, which
+keeps it in session `server`) and pass `"session": "server"`. Input: optional `account_id` and `device_name`. Call it after every
 sign-in on an activated instance too: a key no account owns is adopted into
 the user's account. Codes include `no_licence` (the message has the buy
 link), `device_id_in_use`, `forbidden`, `insufficient_scope` and
@@ -534,6 +670,8 @@ real binary without writing its own fake.
 | The signed-in user | `sub` `u1`, name `Pat`, email `pat@example.com` |
 | Their personal account | `acct-personal` |
 | The clock | 2026-10-17 12:00 UTC, moved with `fake.advance` |
+| Browser sign-in | Pushed requests and `iss` on; `fake.authorize` answers the sign-in page, and `signin.browser.loopback` is approved at once |
+| Password sign-in | Refused until `credentials` is set; `totp` turns on two-factor |
 | Device sign-in | 10-minute codes, a 5-second interval; approve with `fake.approve_device` |
 | Tokens | Access tokens last an hour; refresh tokens rotate and work once |
 | Entitlement tokens and Server statements | Signed with the keys in `fake.keys` |
@@ -546,6 +684,7 @@ real binary without writing its own fake.
 | `fake.keys` | | Returns `{server, entitlement}` key tables (kid → key) and the `issuer` |
 | `fake.state` | | Returns the whole state, to check what arrived (`events`, `tickets`, `docs`, `seats`, `inventory`) |
 | `fake.set` | `patch` | Sets state fields, e.g. `{"license_keys": ["KEY-1"], "server_keys": {"SRV-1": "acct-personal"}, "features": ["my-product.sync"], "free_seats": 2, "team": "acct-team"}`. An unknown field is refused |
+| `fake.authorize` | `authorize_url`, `deny?` | Answers the sign-in page as the person would: returns `{callback_url}`, approved, or canceled with `"deny": true` |
 | `fake.approve_device` / `fake.deny_device` | `user_code` | Decides a pending device sign-in |
 | `fake.publish_pack` | `product`, `pack`, `payload`, `entitled?` | Publishes the next version of a pack |
 | `fake.support_reply` | `ticket_id`, `message` | Support answers a ticket |
@@ -560,7 +699,13 @@ Useful knobs for `fake.set`:
   - `suspended_keys` and `revoked_keys`;
   - `free_seats`, `team`, `features`;
   - `entitlement_expires_at` (RFC 3339);
-- sign-in: `device_grant` (false hides the grant), `sso_audiences`, `sso_sub`;
+- sign-in:
+  - `device_grant` (false hides the grant), `par`, `authorize_iss`;
+  - `browser_user` (`[sub, name, email]`);
+  - `credentials` (`[email, password]`), `totp` (the code that passes),
+    `password_clients`, `password_refusal` (`[status, code]`);
+  - `id_token_overrides` (claims laid over every id_token);
+  - `sso_audiences`, `sso_sub`;
 - refusals: `support_rate_limited`, `open_ticket_cap`, `unknown_products`;
 - limits: `event_batch_cap`, `file_cap` and `file_quota`.
 
