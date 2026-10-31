@@ -969,45 +969,13 @@ impl MerosAuth {
         })
     }
 
-    /// A form body signed with the device key over
-    /// `POST|{path}|{device_id}|{ts}|{hex sha256 of the body before sig}`,
-    /// with `sig` last. Each call signs afresh: the issuer takes a signature
-    /// once.
     fn signed_form(
         &self,
         device: &dyn DeviceSigner,
         endpoint: &str,
         fields: &[(&str, &str)],
     ) -> Result<HttpRequest, Error> {
-        let id = device.identity().ok_or_else(Error::no_identity)?;
-        let ts = (self.now)().to_string();
-        let body = url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(fields)
-            .append_pair("device_id", &id.id)
-            .append_pair("device_pubkey", &id.pubkey)
-            .append_pair("ts", &ts)
-            .finish();
-        let path = url::Url::parse(endpoint)
-            .map(|u| u.path().to_string())
-            .unwrap_or_default();
-        let hash: String = Sha256::digest(body.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let sig = device
-            .sign_message(&format!("POST|{path}|{}|{ts}|{hash}", id.id))
-            .ok_or_else(|| {
-                Error::new(
-                    None,
-                    "device_unavailable",
-                    "This device's key can't sign sign-in requests.",
-                )
-            })?;
-        // base64url needs no escaping.
-        let mut r = HttpRequest::new("POST", endpoint)
-            .header("Content-Type", "application/x-www-form-urlencoded");
-        r.body = format!("{body}&sig={sig}").into_bytes();
-        Ok(r)
+        crate::device::signed_form(device, endpoint, fields, (self.now)())
     }
 
     async fn browser_pending(&self) -> std::collections::BTreeMap<String, BrowserPending> {

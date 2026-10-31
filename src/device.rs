@@ -30,6 +30,51 @@ pub trait DeviceSigner: Send + Sync {
     }
 }
 
+/// A form-encoded request signed with the device key, as meros.co's
+/// sign-in and device-registration endpoints take them: `fields`, then
+/// `device_id`, `device_pubkey` and `ts`, then `sig` last, over
+/// `POST|{path}|{device_id}|{ts}|{hex sha256 of the body before &sig=}`.
+/// Callers put a fresh random value in `fields` (a nonce or state): the
+/// issuer takes each signature once, and Ed25519 signatures are
+/// deterministic.
+pub(crate) fn signed_form(
+    device: &dyn DeviceSigner,
+    endpoint: &str,
+    fields: &[(&str, &str)],
+    ts: i64,
+) -> Result<crate::HttpRequest, crate::Error> {
+    use sha2::{Digest, Sha256};
+    let id = device.identity().ok_or_else(crate::Error::no_identity)?;
+    let ts = ts.to_string();
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(fields)
+        .append_pair("device_id", &id.id)
+        .append_pair("device_pubkey", &id.pubkey)
+        .append_pair("ts", &ts)
+        .finish();
+    let path = url::Url::parse(endpoint)
+        .map(|u| u.path().to_string())
+        .unwrap_or_default();
+    let hash: String = Sha256::digest(body.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let sig = device
+        .sign_message(&format!("POST|{path}|{}|{ts}|{hash}", id.id))
+        .ok_or_else(|| {
+            crate::Error::new(
+                None,
+                "device_unavailable",
+                "This device's key can't sign these requests.",
+            )
+        })?;
+    // base64url needs no escaping.
+    let mut r = crate::HttpRequest::new("POST", endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded");
+    r.body = format!("{body}&sig={sig}").into_bytes();
+    Ok(r)
+}
+
 /// A [`DeviceSigner`] that also keeps the entitlement and describes the
 /// device for its record on the service.
 pub trait LicenseDevice: DeviceSigner {

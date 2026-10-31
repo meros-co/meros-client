@@ -493,24 +493,57 @@ async fn a_registered_device_counts_as_known_until_it_unregisters() {
         .await
         .unwrap();
     assert_eq!(
-        (r.device_id.as_str(), r.account_id.as_str()),
-        ("panel-1", "acct-personal")
+        (
+            r.product.as_str(),
+            r.device_id.as_str(),
+            r.account_id.as_str()
+        ),
+        ("example-app", "panel-1", "acct-personal")
     );
+    // Form-encoded and signed like a pushed sign-in: a nonce, the bearer
+    // token, and sig last.
     let sent = fake.requests_to("/v1/device/register").pop().unwrap();
-    let body = sent.json_body().unwrap();
-    assert_eq!(body["device"]["name"], "Booth");
-    assert!(body["sig"].as_str().is_some_and(|s| s.len() == 86));
+    assert!(
+        sent.header_value("Authorization")
+            .is_some_and(|a| a.starts_with("Bearer "))
+    );
+    let body = String::from_utf8(sent.body.clone()).unwrap();
+    let (_, sig) = body.rsplit_once("&sig=").unwrap();
+    assert_eq!(sig.len(), 86);
+    let f: HashMap<String, String> = sent.form_fields().into_iter().collect();
+    assert_eq!(f["product"], "example-app");
+    assert_eq!(
+        (f["name"].as_str(), f["model"].as_str()),
+        ("Booth", "x86_64")
+    );
+    assert_eq!(f["device_id"], "panel-1");
+    assert!((16..=64).contains(&f["nonce"].len()));
     a.begin_browser_sign_in(&server_options(&device, public))
         .await
         .unwrap();
 
+    // Again, twice in the same second, updates it: each body is different.
+    for _ in 0..2 {
+        cloud
+            .register_device("example-app", device.as_ref(), Some("Booth 2"), None)
+            .await
+            .unwrap();
+    }
     // Another key can't take the id.
     let impostor = TestDevice::with_key("panel-1", "impostor");
     let e = cloud
         .register_device("example-app", &impostor, None, None)
         .await
         .unwrap_err();
+    assert_eq!((e.status, e.code.as_str()), (Some(401), "bad_signature"));
+    // Nor can another account.
+    fake.state().team = Some("acct-team".into());
+    let e = cloud
+        .register_device("example-app", device.as_ref(), None, None)
+        .await
+        .unwrap_err();
     assert_eq!((e.status, e.code.as_str()), (Some(409), "device_id_in_use"));
+    fake.state().team = None;
 
     assert!(
         cloud
@@ -544,4 +577,19 @@ async fn registering_needs_the_scope() {
         (e.status, e.code.as_str()),
         (Some(403), "insufficient_scope")
     );
+}
+
+#[tokio::test]
+async fn a_device_holding_a_seat_isnt_registered_too() {
+    let fake = FakeMeros::new();
+    let a = signed_in(&fake).await;
+    let device = TestDevice::new("seated");
+    fake.state()
+        .devices
+        .insert("seated".into(), device.identity().unwrap().pubkey);
+    let e = cloud(&fake, &a)
+        .register_device("example-app", &device, None, None)
+        .await
+        .unwrap_err();
+    assert_eq!((e.status, e.code.as_str()), (Some(409), "device_id_in_use"));
 }

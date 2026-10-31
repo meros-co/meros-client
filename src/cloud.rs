@@ -148,6 +148,8 @@ pub fn file_hash(bytes: &[u8]) -> String {
 /// of its account see no security warning.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DeviceRegistration {
+    #[serde(default)]
+    pub product: String,
     pub device_id: String,
     pub account_id: String,
     #[serde(default)]
@@ -632,13 +634,16 @@ impl MerosCloud {
     /// `urn:meros:acr:mfa` asks for a two-factor sign-in. Returns
     /// `{login_token, token_type, expires_in, audience, client_id}`.
     /// Refusals include `invalid_target` and `mfa_required`.
-    /// Registers `device` for `product` under the signed-in user's account,
-    /// with the product's Server sign-in. The request is signed with the
-    /// device key over `POST|{path}|{device_id}|{ts}|{nonce}`. Registering again with the same key updates the name and
-    /// model. Refusals include `device_id_in_use` (registered to another
-    /// account, or with another key), `insufficient_scope`, `forbidden`,
-    /// `bad_signature` and `unauthenticated`. A refused token isn't retried,
-    /// since meros.co takes each signature once; call again.
+    /// Registers `device` for `product` under the signed-in user's account
+    /// (their team if they're on one), with a session of the product's
+    /// Server client or its console password client (`devices:write`). The
+    /// form is signed with the device key like the pushed sign-in requests.
+    /// Registering again with the same key updates the name and model.
+    /// Refusals: `device_id_in_use` (409: registered to another account, or
+    /// the device holds a license seat), `bad_signature` (401, also for an id
+    /// registered with another key), `forbidden` (403: not a client that may
+    /// register for this product), `insufficient_scope`, `invalid_request`,
+    /// `rate_limited`. A refused token isn't retried; call again.
     pub async fn register_device(
         &self,
         product: &str,
@@ -646,14 +651,14 @@ impl MerosCloud {
         name: Option<&str>,
         model: Option<&str>,
     ) -> Result<DeviceRegistration, Error> {
-        let mut extra = Map::new();
+        let mut extra = Vec::new();
         if let Some(n) = name.filter(|n| !n.is_empty()) {
-            extra.insert("name".into(), json!(n));
+            extra.push(("name", n));
         }
         if let Some(m) = model.filter(|m| !m.is_empty()) {
-            extra.insert("model".into(), json!(m));
+            extra.push(("model", m));
         }
-        self.device_call("/v1/device/register", product, device, extra)
+        self.device_call("/v1/device/register", product, device, &extra)
             .await?
             .parse()
     }
@@ -666,57 +671,37 @@ impl MerosCloud {
         device: &dyn DeviceSigner,
     ) -> Result<bool, Error> {
         let r = self
-            .device_call("/v1/device/unregister", product, device, Map::new())
+            .device_call("/v1/device/unregister", product, device, &[])
             .await?;
         Ok(r.value()["unregistered"].as_bool().unwrap_or(false))
     }
 
-    /// A device-signed call with the user's bearer token.
+    /// A device-signed form with the user's bearer token.
     async fn device_call(
         &self,
         path: &str,
         product: &str,
         device: &dyn DeviceSigner,
-        mut fields: Map<String, Value>,
+        extra: &[(&str, &str)],
     ) -> Result<HttpResponse, Error> {
-        let id = device.identity().ok_or_else(Error::no_identity)?;
-        let ts = unix_now();
-        // A fresh nonce in every signed string: meros.co takes each
-        // signature once, and two calls can share a second.
+        // A fresh nonce in every signed body: meros.co takes each signature
+        // once, and two calls can share a second.
         let nonce: String = {
             use rand::Rng;
+            const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
             let mut rng = rand::rng();
             (0..22)
-                .map(|_| {
-                    const ABC: &[u8] =
-                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-                    ABC[rng.random_range(0..ABC.len())] as char
-                })
+                .map(|_| ABC[rng.random_range(0..ABC.len())] as char)
                 .collect()
         };
-        let sig = device
-            .sign_message(&format!("POST|{path}|{}|{ts}|{nonce}", id.id))
-            .ok_or_else(|| {
-                Error::new(
-                    None,
-                    "device_unavailable",
-                    "This device's key can't sign registration requests.",
-                )
-            })?;
-        fields.insert("id".into(), json!(id.id));
-        fields.insert("pubkey".into(), json!(id.pubkey));
-        let body =
-            json!({"product": product, "device": fields, "ts": ts, "nonce": nonce, "sig": sig});
+        let mut fields = vec![("product", product), ("nonce", nonce.as_str())];
+        fields.extend_from_slice(extra);
         let token = self.token.access_token(false).await?;
-        let r = self
-            .transport
-            .send(
-                HttpRequest::new("POST", self.url(path, &[]))
-                    .header("Authorization", format!("Bearer {token}"))
-                    .header("Accept", "application/json")
-                    .json(&body),
-            )
-            .await?;
+        let request =
+            crate::device::signed_form(device, &self.url(path, &[]), &fields, unix_now())?
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Accept", "application/json");
+        let r = self.transport.send(request).await?;
         if r.status >= 400 {
             return Err(Error::from_response(&r));
         }

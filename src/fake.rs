@@ -962,9 +962,12 @@ fn signed_body(st: &mut FakeState, r: &HttpRequest, path: &str) -> Result<bool, 
     Ok(known.is_some())
 }
 
-/// `POST /v1/device/register` and `/unregister`: the user's bearer token
-/// (with `devices:write`) and the device's signature over
-/// `POST|{path}|{device_id}|{ts}|{nonce}`, each signature once.
+/// `POST /v1/device/register` and `/unregister`, as meros.co: the user's
+/// bearer token (with `devices:write`), and a form signed with the device key
+/// like `/oauth/par` carrying `product`, a 16 to 64 character `nonce`, and
+/// for register an optional `name` and `model`. An id registered with
+/// another key is `401 bad_signature`; one registered to another account, or
+/// holding a seat, is `409 device_id_in_use`.
 fn device_registration(st: &mut FakeState, r: &HttpRequest, op: &str) -> HttpResponse {
     let token = r
         .header_value("Authorization")
@@ -972,58 +975,57 @@ fn device_registration(st: &mut FakeState, r: &HttpRequest, op: &str) -> HttpRes
         .trim_start_matches("Bearer ")
         .to_string();
     if !st.access.contains(&token) {
-        return err(401, "unauthenticated");
+        return oauth_err(401, "unauthenticated", "Sign in first.");
     }
     if !st.devices_scope {
-        return err(403, "insufficient_scope");
+        return oauth_err(403, "insufficient_scope", "devices:write is required.");
     }
-    let body = r.json_body().unwrap_or(Value::Null);
-    let device = &body["device"];
-    let (id, pubkey) = (s(device, "id"), s(device, "pubkey"));
-    let ts = body["ts"].as_i64().unwrap_or(0);
-    let (sig, nonce) = (s(&body, "sig"), s(&body, "nonce"));
-    if id.is_empty() || nonce.is_empty() || s(&body, "product").is_empty() {
-        return err(400, "invalid_request");
+    let f: HashMap<String, String> = r.form_fields().into_iter().collect();
+    let nonce_ok = f.get("nonce").is_some_and(|n| {
+        (16..=64).contains(&n.len())
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    });
+    if !nonce_ok {
+        return oauth_err(
+            400,
+            "invalid_request",
+            "A random nonce of 16 to 64 URL-safe characters is required.",
+        );
     }
-    let message = format!("POST|/v1/device/{op}|{id}|{ts}|{nonce}");
-    let verified = (|| {
-        let key: [u8; 32] = URL_SAFE_NO_PAD.decode(&pubkey).ok()?.try_into().ok()?;
-        let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(&sig).ok()?).ok()?;
-        VerifyingKey::from_bytes(&key)
-            .ok()?
-            .verify(message.as_bytes(), &sig)
-            .ok()
-    })()
-    .is_some();
-    if !verified || !st.used_signatures.insert(sig) {
-        return err(401, "bad_signature");
+    if let Err(e) = signed_body(st, r, &format!("/v1/device/{op}")) {
+        return e;
     }
-    let account = PERSONAL.to_string();
-    let theirs = |k: &String, a: &String| *k != pubkey || *a != account;
+    let id = f.get("device_id").cloned().unwrap_or_default();
+    let pubkey = f.get("device_pubkey").cloned().unwrap_or_default();
+    let product = f
+        .get("product")
+        .cloned()
+        .unwrap_or_else(|| st.request_product.clone());
     if op == "unregister" {
-        return match st.registered_devices.get(&id) {
-            Some((k, a)) if theirs(k, a) => err(409, "device_id_in_use"),
-            Some(_) => {
-                st.registered_devices.remove(&id);
-                reply(200, json!({"unregistered": true}))
-            }
-            None => reply(200, json!({"unregistered": false})),
-        };
+        let was = st.registered_devices.remove(&id).is_some();
+        return reply(200, json!({"unregistered": was}));
     }
-    if st
-        .registered_devices
-        .get(&id)
-        .is_some_and(|(k, a)| theirs(k, a))
-        || st.devices.get(&id).is_some_and(|k| *k != pubkey)
+    let account = st.team.clone().unwrap_or_else(|| PERSONAL.to_string());
+    if st.devices.contains_key(&id)
+        || st
+            .registered_devices
+            .get(&id)
+            .is_some_and(|(_, a)| *a != account)
     {
-        return err(409, "device_id_in_use");
+        return oauth_err(
+            409,
+            "device_id_in_use",
+            "This device is registered to another account. Remove it there first.",
+        );
     }
     st.registered_devices
         .insert(id.clone(), (pubkey, account.clone()));
     let (name, _) = account_label(st, &account);
     reply(
         200,
-        json!({"device_id": id, "account_id": account, "account_name": name, "registered_at": st.time()}),
+        json!({"product": product, "device_id": id, "account_id": account,
+               "account_name": name, "registered_at": st.time()}),
     )
 }
 

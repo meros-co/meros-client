@@ -203,22 +203,30 @@ Returns `{device_id, pubkey, key_source}` and makes the key on first use.
 ### `device.register` and `device.unregister`
 
 For products whose devices hold no license seat. `device.register` records
-this device under the account of the user signed in to `session` (default
-`server`, the instance's own session; a console passes the session it
-signed in with). The request carries that session's token, from the client
-the session signed in with. A registered device
-counts as known to meros.co: its pushed sign-ins may use public host names,
-and members of its account see no security warning.
+this device under the account of the user signed in to `session`: their
+team if they're on one, else their personal account. The default session
+is `server`, the instance's own; a console passes the session it signed in
+with. meros.co accepts the product's Server client or its console password
+client, with scope `devices:write`. A registered device counts as known to
+meros.co: its pushed sign-ins may use public host names, and members of its
+account see no security warning.
 
 - Input: `product`, plus optional `device_name` and `model` (default: the
   OS and architecture).
-- Returns `{device_id, account_id, account_name, registered_at}`.
+- Returns `{product, device_id, account_id, account_name, registered_at}`.
   Registering again with the same key updates the name and model.
-- The request carries the session's token and is signed with the device key
-  over `POST|{path}|{device_id}|{ts}|{nonce}`, a fresh nonce each time.
-- Refusals include `device_id_in_use` (registered to another account or
-  with another key), `insufficient_scope`, `forbidden`, `bad_signature`
-  and `unauthenticated`; exit 4 `no_sign_in` without a session.
+- The request carries the session's token. Like a pushed sign-in, it is a
+  form signed with the device key over
+  `POST|{path}|{device_id}|{ts}|{sha256 hex of the body before &sig=}`,
+  with a fresh random `nonce` in the body each time.
+- Refusals:
+  - `device_id_in_use` (409): registered to another account, or the device
+    holds a license seat;
+  - `bad_signature` (401): includes an id registered with another key;
+  - `forbidden` (403): a client that may not register for this product;
+  - `insufficient_scope`, `invalid_request`, `rate_limited` and
+    `unauthenticated`;
+  - exit 4 `no_sign_in` without a session.
 
 `device.unregister` removes it and returns `{unregistered}`, false when it
 wasn't registered. Signing the registering session out
