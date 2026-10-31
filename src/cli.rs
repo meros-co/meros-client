@@ -416,9 +416,91 @@ fn state_error(e: impl std::fmt::Display) -> Error {
 struct State {
     dir: PathBuf,
     read_only: bool,
-    /// Seals every file written, when the caller gives a key file.
+    /// Seals every file written, when the caller gives a key source.
     key: Option<chacha20poly1305::Key>,
+    /// Where the key came from: `keychain`, `file` or `none`.
+    key_source: &'static str,
     _lock: Option<File>,
+}
+
+/// Where the sealing key lives.
+enum KeySource {
+    /// No key: files are protected by their permissions only.
+    None,
+    /// `key_file`.
+    File(String),
+    /// The OS keychain (Windows Credential Manager, the macOS Keychain, the
+    /// Secret Service on Linux), under `service` and `account`; `fallback`
+    /// is the key file used when this machine has no keychain.
+    Keychain {
+        service: String,
+        account: String,
+        fallback: String,
+    },
+}
+
+impl KeySource {
+    /// From `key_source`, `keychain_service`, `keychain_account` and
+    /// `key_file`.
+    fn from_input(input: &Map<String, Value>, dir: &str) -> Result<KeySource, Error> {
+        let text = |k: &str| {
+            input
+                .get(k)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let key_file = text("key_file");
+        match text("key_source").as_deref() {
+            None | Some("file") => Ok(match key_file {
+                Some(f) => KeySource::File(f),
+                None if text("key_source").is_some() => {
+                    return Err(bad_input("`key_source: \"file\"` needs `key_file`."));
+                }
+                None => KeySource::None,
+            }),
+            Some("keychain") => {
+                let dir = Path::new(dir);
+                let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+                let account = text("keychain_account").unwrap_or_else(|| {
+                    let hash = <sha2::Sha256 as sha2::Digest>::digest(
+                        canonical.to_string_lossy().as_bytes(),
+                    );
+                    format!("state-{}", hex(&hash[..8]))
+                });
+                // Beside the state directory, never inside it.
+                let fallback = key_file.unwrap_or_else(|| {
+                    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+                    name.push(".key");
+                    dir.with_file_name(name).to_string_lossy().to_string()
+                });
+                Ok(KeySource::Keychain {
+                    service: text("keychain_service").unwrap_or_else(|| "meros-client".into()),
+                    account,
+                    fallback,
+                })
+            }
+            Some(other) => Err(bad_input(format!(
+                "`key_source` is `keychain` or `file`, not `{other}`."
+            ))),
+        }
+    }
+}
+
+/// Which key source a state directory was set up with, kept in
+/// `key-source.json` (nothing secret), so a keychain that's unavailable
+/// later is an error rather than a reason to start over with a new key.
+const KEY_SOURCE_FILE: &str = "key-source.json";
+
+fn parse_key(text: &str) -> Option<chacha20poly1305::Key> {
+    let text = text.trim();
+    if text.len() != 64 {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(text.get(i * 2..i * 2 + 2)?, 16).ok())
+        .collect::<Option<_>>()?;
+    Some(*chacha20poly1305::Key::from_slice(&bytes))
 }
 
 /// The key in `key_file`: 32 random bytes as hex, made on first use.
@@ -434,19 +516,8 @@ fn load_key(path: &str, dir: &Path, create: bool) -> Result<chacha20poly1305::Ke
             "Keep `key_file` outside the state directory, or it protects nothing.",
         ));
     }
-    let parse = |text: &str| -> Option<chacha20poly1305::Key> {
-        let text = text.trim();
-        if text.len() != 64 {
-            return None;
-        }
-        let bytes: Vec<u8> = (0..32)
-            .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16))
-            .collect::<Result<_, _>>()
-            .ok()?;
-        Some(*chacha20poly1305::Key::from_slice(&bytes))
-    };
     match fs::read_to_string(&path) {
-        Ok(text) => parse(&text).ok_or_else(|| state_error("key_file is not 64 hex digits")),
+        Ok(text) => parse_key(&text).ok_or_else(|| state_error("key_file is not 64 hex digits")),
         Err(_) if create => {
             let bytes: [u8; 32] = rand::random();
             write_private(&path, hex(&bytes).as_bytes()).map_err(state_error)?;
@@ -456,11 +527,65 @@ fn load_key(path: &str, dir: &Path, create: bool) -> Result<chacha20poly1305::Ke
     }
 }
 
+/// What the keychain answered.
+enum Keychain {
+    Key(chacha20poly1305::Key),
+    /// It works but holds no key for this state directory.
+    Empty,
+    /// This machine has no usable keychain (no Secret Service on a headless
+    /// Linux box, say), or it is turned off with `MEROS_CLIENT_KEYCHAIN=off`.
+    Unavailable(String),
+}
+
+/// The key in the OS keychain, made on first use when `create`.
+#[cfg(feature = "keychain")]
+fn keychain_key(service: &str, account: &str, create: bool) -> Result<Keychain, Error> {
+    use keyring::Error as K;
+    if std::env::var("MEROS_CLIENT_KEYCHAIN").is_ok_and(|v| v == "off") {
+        return Ok(Keychain::Unavailable(
+            "turned off by MEROS_CLIENT_KEYCHAIN".into(),
+        ));
+    }
+    let unavailable = |e: &K| {
+        matches!(
+            e,
+            K::NoDefaultStore | K::PlatformFailure(_) | K::NoStorageAccess(_)
+        )
+    };
+    let entry = match keyring::Entry::new(service, account) {
+        Ok(e) => e,
+        Err(e) if unavailable(&e) => return Ok(Keychain::Unavailable(e.to_string())),
+        Err(e) => return Err(state_error(format!("keychain: {e}"))),
+    };
+    match entry.get_password() {
+        Ok(text) => parse_key(&text)
+            .map(Keychain::Key)
+            .ok_or_else(|| state_error("the keychain entry is not 64 hex digits")),
+        Err(K::NoEntry) if create => {
+            let bytes: [u8; 32] = rand::random();
+            match entry.set_password(&hex(&bytes)) {
+                Ok(()) => Ok(Keychain::Key(*chacha20poly1305::Key::from_slice(&bytes))),
+                Err(e) if unavailable(&e) => Ok(Keychain::Unavailable(e.to_string())),
+                Err(e) => Err(state_error(format!("keychain: {e}"))),
+            }
+        }
+        Err(K::NoEntry) => Ok(Keychain::Empty),
+        Err(e) if unavailable(&e) => Ok(Keychain::Unavailable(e.to_string())),
+        Err(e) => Err(state_error(format!("keychain: {e}"))),
+    }
+}
+
+#[cfg(not(feature = "keychain"))]
+fn keychain_key(_service: &str, _account: &str, _create: bool) -> Result<Keychain, Error> {
+    Ok(Keychain::Unavailable(
+        "built without the `keychain` feature".into(),
+    ))
+}
+
 impl State {
-    fn open(dir: &str, key_file: Option<&str>) -> Result<State, Error> {
+    fn open(dir: &str, source: &KeySource) -> Result<State, Error> {
         let dir = PathBuf::from(dir);
         create_private_dir(&dir).map_err(state_error)?;
-        let key = key_file.map(|k| load_key(k, &dir, true)).transpose()?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -468,24 +593,21 @@ impl State {
             .open(dir.join("lock"))
             .map_err(state_error)?;
         lock.lock().map_err(state_error)?;
+        // Under the lock, so two first calls don't make two keys.
+        let (key, key_source) = load_source(&dir, source, true)?;
         Ok(State {
             dir,
             read_only: false,
             key,
+            key_source,
             _lock: Some(lock),
         })
     }
 
     /// Opens without creating anything: a shared lock when a writer has
     /// made the lock file, so a read never sees a half-finished call.
-    fn open_read_only(dir: &str, key_file: Option<&str>) -> Result<State, Error> {
+    fn open_read_only(dir: &str, source: &KeySource) -> Result<State, Error> {
         let dir = PathBuf::from(dir);
-        // No key file yet means nothing was ever sealed with it: read on
-        // without one rather than fail.
-        let key = key_file
-            .filter(|k| Path::new(k).exists())
-            .map(|k| load_key(k, &dir, false))
-            .transpose()?;
         let lock = match File::open(dir.join("lock")) {
             Ok(f) => {
                 f.lock_shared().map_err(state_error)?;
@@ -493,10 +615,12 @@ impl State {
             }
             Err(_) => None,
         };
+        let (key, key_source) = load_source(&dir, source, false)?;
         Ok(State {
             dir,
             read_only: true,
             key,
+            key_source,
             _lock: lock,
         })
     }
@@ -570,6 +694,71 @@ impl State {
     fn remove(&self, name: &str) {
         if !self.read_only {
             let _ = fs::remove_file(self.path(name));
+        }
+    }
+}
+
+/// The sealing key from `source`, and which source gave it (`keychain`,
+/// `file` or `none`). With the keychain, the first call that writes records
+/// the choice in [`KEY_SOURCE_FILE`]: the keychain when it answered, else
+/// the fallback file. A state directory set up on the keychain never falls
+/// back later.
+fn load_source(
+    dir: &Path,
+    source: &KeySource,
+    create: bool,
+) -> Result<(Option<chacha20poly1305::Key>, &'static str), Error> {
+    let from_file = |path: &str| -> Result<Option<chacha20poly1305::Key>, Error> {
+        // Read-only and no key file yet: nothing was ever sealed with it.
+        if !create && !Path::new(path).exists() {
+            return Ok(None);
+        }
+        load_key(path, dir, create).map(Some)
+    };
+    let (service, account, fallback) = match source {
+        KeySource::None => return Ok((None, "none")),
+        KeySource::File(path) => return Ok((from_file(path)?, "file")),
+        KeySource::Keychain {
+            service,
+            account,
+            fallback,
+        } => (service, account, fallback),
+    };
+    let marker: Option<Value> = fs::read(dir.join(KEY_SOURCE_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let set_up = marker
+        .as_ref()
+        .and_then(|m| m["source"].as_str().map(str::to_string));
+    let mark = |v: Value| -> Result<(), Error> {
+        if create && set_up.is_none() {
+            write_private(&dir.join(KEY_SOURCE_FILE), v.to_string().as_bytes())
+                .map_err(state_error)?;
+        }
+        Ok(())
+    };
+    if set_up.as_deref() == Some("file") {
+        let path = marker
+            .as_ref()
+            .and_then(|m| m["key_file"].as_str())
+            .unwrap_or(fallback);
+        return Ok((from_file(path)?, "file"));
+    }
+    match keychain_key(service, account, create)? {
+        Keychain::Key(k) => {
+            mark(json!({"source": "keychain", "service": service, "account": account}))?;
+            Ok((Some(k), "keychain"))
+        }
+        Keychain::Empty => Ok((None, "keychain")),
+        Keychain::Unavailable(why) if set_up.as_deref() == Some("keychain") => Err(state_error(
+            format!("this state's key is in the OS keychain, which isn't available: {why}"),
+        )),
+        Keychain::Unavailable(why) => {
+            let key = from_file(fallback)?;
+            if key.is_some() {
+                mark(json!({"source": "file", "key_file": fallback, "keychain_unavailable": why}))?;
+            }
+            Ok((key, "file"))
         }
     }
 }
@@ -912,15 +1101,15 @@ impl Ctx {
         fake: Option<Arc<crate::fake::FakeMeros>>,
         read_only: bool,
     ) -> Result<Ctx, Error> {
-        let key_file = input
-            .get("key_file")
-            .and_then(|v| v.as_str())
-            .filter(|k| !k.is_empty());
         let state = match input.get("state_dir").and_then(|v| v.as_str()) {
-            Some(d) if !d.is_empty() && read_only => {
-                Some(Arc::new(State::open_read_only(d, key_file)?))
+            Some(d) if !d.is_empty() => {
+                let source = KeySource::from_input(&input, d)?;
+                Some(Arc::new(if read_only {
+                    State::open_read_only(d, &source)?
+                } else {
+                    State::open(d, &source)?
+                }))
             }
-            Some(d) if !d.is_empty() => Some(Arc::new(State::open(d, key_file)?)),
             _ => None,
         };
         Ok(Ctx {
@@ -1154,7 +1343,11 @@ impl Ctx {
         match command {
             "device.identity" => {
                 let d = self.device()?;
-                Ok(json!({"device_id": d.id, "pubkey": d.pubkey()}))
+                Ok(json!({
+                    "device_id": d.id,
+                    "pubkey": d.pubkey(),
+                    "key_source": self.state()?.key_source,
+                }))
             }
             "device.register" | "device.unregister" => self.registration(&command[7..]).await,
             c if c.starts_with("signin.") => self.signin(&c[7..]).await,
@@ -1240,10 +1433,12 @@ impl Ctx {
             "status" => {
                 let auth = self.auth()?;
                 auth.load().await;
-                Ok(match auth.user() {
+                let mut out = match auth.user() {
                     Some(u) => json!({"signed_in": true, "user": user_json(&u)}),
                     None => json!({"signed_in": false}),
-                })
+                };
+                out["key_source"] = json!(state.key_source);
+                Ok(out)
             }
             "token" => {
                 let auth = self.signed_in().await?;

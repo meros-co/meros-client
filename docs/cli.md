@@ -98,6 +98,7 @@ settings on every call, and add the command's own fields.
 | `session` | sign-in, cloud, server login, account support, events | Which identity to act as: a handle the caller picks (letters, digits, `_`, `-`). Default `default`; a new browser or password sign-in defaults to one session per person (see Clients and sessions) |
 | `sub` | the same | Act as whichever session is signed in as this subject, instead of naming the `session` |
 | `key_file` | all | Seal every stored file with the key in this file (below). Made on first use; must be outside the state directory |
+| `key_source`, `keychain_service`, `keychain_account` | all | `keychain` keeps the sealing key in the OS keychain instead (below); `file` (the default with `key_file`) uses `key_file` |
 
 ## The state directory
 
@@ -109,6 +110,7 @@ settings on every call, and add the command's own fields.
 | `signin/` | Browser sign-ins waiting for their callbacks, two-factor steps waiting for their codes, and the page a loopback sign-in is waiting on |
 | `server.json` | The Server statement and its feature token |
 | `device-registration.json` | The device's registration and the session that made it |
+| `key-source.json` | Which key source the state directory was set up with (see Sealing with the OS keychain); nothing secret |
 | `license.json` | The device entitlement token |
 | `events/` | The local event log, the install's identity, and undelivered events (`outbox.json`) |
 | `cache/` | The last entitlements answer (per session) and the latest copy of each pack, for offline use. A session's entries are cleared when it signs out |
@@ -145,6 +147,35 @@ refresh tokens. Like theirs, it doesn't protect against someone who can read
 both the directory and the key file. That would need a passphrase typed at
 start, which unattended devices can't have.
 
+### Sealing with the OS keychain
+
+Desktop apps keep the key where they kept their tokens before: with
+`"key_source": "keychain"`, the helper makes the key on first use and keeps
+it in the OS keychain:
+- Windows Credential Manager;
+- the macOS Keychain;
+- the Secret Service on Linux (GNOME Keyring, KWallet).
+
+The entry is `keychain_service` (default `meros-client`) and
+`keychain_account` (default `state-` and a hash of the state directory's
+path, so each state directory has its own key).
+
+When the machine has no keychain (a headless Linux box with no Secret
+Service, say), the key goes in a file instead: `key_file` if given, else
+`{state_dir}.key` beside the state directory. The first call that writes
+records which one the state directory uses, in `key-source.json` (nothing
+secret), and it stays that way:
+- a state directory set up on the keychain never falls back to a file. If
+  the keychain isn't available later, calls exit 4 with `state_error`
+  rather than start over with a new key;
+- one set up on the file keeps using it, even once a keychain appears.
+
+`device.identity` and `signin.status` report which one is in use as
+`key_source`: `keychain`, `file` or `none`. Set `MEROS_CLIENT_KEYCHAIN=off`
+in the environment to use the file on a machine whose keychain prompts or
+hangs. Switching an existing state directory between sources isn't
+automatic: sign out and start a new state directory.
+
 ### Several identities
 
 Each `session` handle is one identity, with its own client and scopes, its
@@ -167,7 +198,7 @@ result.
 
 ### `device.identity`
 
-Returns `{device_id, pubkey}` and makes the key on first use.
+Returns `{device_id, pubkey, key_source}` and makes the key on first use.
 
 ### `device.register` and `device.unregister`
 
@@ -365,7 +396,8 @@ Call it every `interval` seconds:
 
 ### `signin.status`
 
-`{"signed_in": false}` or `{"signed_in": true, "user": {...}}`. Read-only.
+`{"signed_in": false}` or `{"signed_in": true, "user": {...}}`, plus
+`key_source` (`keychain`, `file` or `none`). Read-only.
 
 ### `signin.list`
 

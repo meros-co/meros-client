@@ -15,7 +15,7 @@ Flutter apps call it from their Rust core through flutter_rust_bridge.
 | `events` | The Meros Event Envelope v1 (`meros-co/meros-event-spec` v0.1.1): a capped local NDJSON log, and batched delivery to collectors. Feature `events-runtime` adds periodic delivery on Tokio |
 | `device` | `EntitlementDevice`: a `LicenseDevice` over a meros-entitlement `Store`, keeping its device id, key and seat. Feature `entitlement` |
 | `fake` | `FakeMeros`: all of the services in memory as a `Transport`, for app tests with no network. Feature `fake` |
-| `cli` | The `meros-client` command-line helper: every client above as JSON in and JSON out, for apps not written in Rust, with the device key and sessions kept in a state directory the caller chooses. Feature `cli`; see [docs/cli.md](docs/cli.md) |
+| `cli` | The `meros-client` command-line helper: every client above as JSON in and JSON out, for apps not written in Rust, with the device key and sessions kept in a state directory the caller chooses, sealed with a key from the OS keychain or a key file. Feature `cli`; see [docs/cli.md](docs/cli.md) |
 
 ## Principles
 
