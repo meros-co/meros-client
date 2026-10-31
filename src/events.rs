@@ -291,6 +291,34 @@ impl Emitter {
         }
     }
 
+    /// Queues another product's event for the collectors exactly as it
+    /// came: same id, time, sequence and source, so a collector that has it
+    /// already counts it as a duplicate. It isn't written to this install's
+    /// log, whose sequence is this install's own. Refused when it isn't an
+    /// Envelope v1 event or is over [`MAX_EVENT_BYTES`].
+    pub fn relay(&self, envelope: Envelope) -> Result<(), String> {
+        if envelope.envelope != ENVELOPE {
+            return Err(format!("envelope {} is not supported", envelope.envelope));
+        }
+        if envelope.id.is_empty() || envelope.occurred_at.is_empty() || envelope.kind.is_empty() {
+            return Err("an event needs id, occurred_at and type".into());
+        }
+        let size = serde_json::to_vec(&envelope).map_or(usize::MAX, |v| v.len());
+        if size > MAX_EVENT_BYTES {
+            return Err(format!("event {} is over 64 KiB", envelope.id));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.collectors.is_empty() {
+            return Ok(());
+        }
+        if inner.pending.len() >= PENDING_CAP {
+            inner.pending.pop_front();
+            inner.dropped += 1;
+        }
+        inner.pending.push_back(envelope);
+        Ok(())
+    }
+
     /// Changes where events go (and the site they say they come from).
     /// With no collectors, nothing is queued.
     pub fn configure(&self, site: Option<String>, collectors: Vec<Collector>) {

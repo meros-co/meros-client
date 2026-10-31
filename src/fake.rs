@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -60,14 +61,14 @@ pub const ENTITLEMENT_LIFETIME: i64 = 30 * 86_400;
 pub const PERSONAL: &str = "acct-personal";
 
 /// One stored document version.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocVersion {
     pub version: i64,
     pub body: Value,
 }
 
 /// A support ticket in the fake.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FakeTicket {
     pub id: String,
     pub device_id: String,
@@ -83,7 +84,11 @@ pub struct FakeTicket {
 /// Makes an entitlement token for a device id.
 pub type Mint = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-/// Everything the fake knows, and the knobs that change its answers.
+/// Everything the fake knows, and the knobs that change its answers. It
+/// serializes, so a fake can be kept between processes (the command-line
+/// helper's fake mode); `mint` and `requests` aren't kept.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct FakeState {
     /// Feature flags `/v1/entitlements` reports.
     pub features: BTreeSet<String>,
@@ -137,6 +142,7 @@ pub struct FakeState {
     /// `(403, "email_not_verified")`.
     pub claim_refusal: Option<(u16, String)>,
     /// Makes entitlement tokens for a device id; default `ent-{id}-{n}`.
+    #[serde(skip)]
     pub mint: Option<Mint>,
     /// Stored files, by `account/product/collection/sha256`.
     pub files: BTreeMap<String, Vec<u8>>,
@@ -170,6 +176,7 @@ pub struct FakeState {
     /// The batch cap event ingest enforces.
     pub event_batch_cap: usize,
     /// Every request, in order.
+    #[serde(skip)]
     pub requests: Vec<HttpRequest>,
     /// The fake's clock, unix seconds.
     pub clock: i64,
@@ -183,9 +190,9 @@ pub struct FakeState {
     pub device_grant: bool,
     /// Device sign-ins (RFC 8628) by device code.
     pub device_sign_ins: HashMap<String, FakeDeviceSignIn>,
-    /// Published data packs by `(product, pack)`: each version's payload,
-    /// and whether the pack needs the product's entitlement.
-    pub packs: HashMap<(String, String), (bool, Vec<Value>)>,
+    /// Published data packs by `"{product}/{pack}"`: whether the pack needs
+    /// the product's entitlement, and each version's payload.
+    pub packs: HashMap<String, (bool, Vec<Value>)>,
     /// Device inventories by product.
     pub inventory: BTreeMap<String, Vec<Value>>,
     /// Services the user's login tokens may be minted for.
@@ -198,6 +205,8 @@ pub struct FakeState {
     /// entitlements answer; None lists it without an expiry.
     pub entitlement_expires_at: Option<String>,
     codes: HashMap<String, (String, String)>,
+    /// The product a device-API request named, for the statements it gets.
+    request_product: String,
     refresh: HashSet<String>,
     access: HashSet<String>,
     /// Each access token's refresh token, so a revocation takes both.
@@ -262,6 +271,7 @@ impl Default for FakeState {
             login_tokens: HashMap::new(),
             entitlement_expires_at: None,
             codes: HashMap::new(),
+            request_product: "example-app".into(),
             refresh: HashSet::new(),
             access: HashSet::new(),
             pairs: HashMap::new(),
@@ -377,7 +387,7 @@ impl FakeState {
 }
 
 /// A device sign-in (RFC 8628) waiting at the fake.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FakeDeviceSignIn {
     pub user_code: String,
     pub scope: String,
@@ -425,6 +435,14 @@ impl FakeMeros {
         Arc::new(FakeMeros::default())
     }
 
+    /// A fake picking up from `state`, such as one saved with
+    /// `serde_json::to_value(&*fake.state())`.
+    pub fn with_state(state: FakeState) -> Arc<FakeMeros> {
+        Arc::new(FakeMeros {
+            state: Mutex::new(state),
+        })
+    }
+
     /// The fake's state, to set knobs and inspect what happened.
     pub fn state(&self) -> MutexGuard<'_, FakeState> {
         self.state.lock().unwrap()
@@ -454,7 +472,7 @@ impl FakeMeros {
         let mut st = self.state();
         let entry = st
             .packs
-            .entry((product.to_string(), pack.to_string()))
+            .entry(format!("{product}/{pack}"))
             .or_insert((entitled, Vec::new()));
         entry.0 = entitled;
         entry.1.push(payload);
@@ -745,7 +763,7 @@ fn feed(
     signed_in: bool,
 ) -> HttpResponse {
     use ed25519_dalek::Signer;
-    let Some((entitled, versions)) = st.packs.get(&(product.to_string(), pack.to_string())) else {
+    let Some((entitled, versions)) = st.packs.get(&format!("{product}/{pack}")) else {
         return err(404, "unknown_pack");
     };
     if *entitled {
@@ -1015,7 +1033,7 @@ fn server_reply(st: &mut FakeState, device_id: &str) -> HttpResponse {
         "typ": "server_licence",
         "kid": SERVER_KID,
         "jti": format!("jti-{jti}"),
-        "product": "example-app",
+        "product": st.request_product,
         "edition": "server",
         "account_id": seat["account_id"],
         "account_type": seat["account_type"],
@@ -1052,6 +1070,10 @@ fn entitlement(st: &mut FakeState, device_id: &str) -> HttpResponse {
 fn device_api(st: &mut FakeState, r: &HttpRequest, rest: &[&str]) -> HttpResponse {
     let path = format!("/v1/{}", rest.join("/"));
     let body = r.json_body().unwrap_or(Value::Null);
+    st.request_product = match s(&body, "product") {
+        p if p.is_empty() => "example-app".into(),
+        p => p,
+    };
     let ts = body.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
     let sig = s(&body, "sig");
     let bearer = r
