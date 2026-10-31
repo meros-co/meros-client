@@ -347,7 +347,7 @@ const PENDING_KEY: &str = "meros.pending";
 const ACCESS_KEY: &str = "meros.access_token";
 const LOGIN_PENDING_KEY: &str = "meros.login_pending";
 const BROWSER_PENDING_KEY: &str = "meros.browser_pending";
-/// The client a session's tokens belong to, when it isn't the configured one.
+/// The client a session's tokens belong to.
 const CLIENT_KEY: &str = "meros.client_id";
 
 #[derive(Serialize, Deserialize)]
@@ -749,9 +749,9 @@ impl MerosAuth {
                 self.revoke(&token).await;
             }
         }
-        let client =
-            (session.client_id != self.config.client_id).then(|| session.client_id.clone());
-        self.store.write(CLIENT_KEY, client).await;
+        self.store
+            .write(CLIENT_KEY, Some(session.client_id.clone()))
+            .await;
         self.keep(session.tokens).await;
         let user = session.user;
         self.store
@@ -1282,7 +1282,9 @@ impl MerosAuth {
     /// (the configured client) and stores the session.
     async fn signed_in_with(&self, access: &str) -> Result<MerosUser, Error> {
         let user = self.userinfo(access).await?;
-        self.store.write(CLIENT_KEY, None).await;
+        self.store
+            .write(CLIENT_KEY, Some(self.config.client_id.clone()))
+            .await;
         self.store
             .write(USER_KEY, serde_json::to_string(&user).ok())
             .await;

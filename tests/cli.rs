@@ -1820,3 +1820,130 @@ async fn device_unregister_removes_the_registration() {
     let out = env.ok("signin.signout", json!({"session": "server"})).await;
     assert!(out.get("device_registration").is_none());
 }
+
+#[tokio::test]
+async fn a_person_sign_in_never_lands_in_another_clients_session_for_the_same_user() {
+    let env = Env::new();
+    // The instance, signed in as u1 under its own client in session "instance".
+    let b = env
+        .ok(
+            "signin.browser.begin",
+            json!({"client": "server", "server_client_id": "server-client",
+                   "session": "instance", "redirect_uri": SERVER_CALLBACK}),
+        )
+        .await;
+    let callback = env.fake.approve(b["authorize_url"].as_str().unwrap());
+    let done = env
+        .ok("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+    assert_eq!(done["session"], "instance");
+    let instance_file = std::fs::read_to_string(env.state_file("sessions/instance.json")).unwrap();
+
+    // The same person signs in through the browser client, by_user.
+    let b = env
+        .ok(
+            "signin.browser.begin",
+            json!({"redirect_uri": SERVER_CALLBACK}),
+        )
+        .await;
+    let callback = env.fake.approve(b["authorize_url"].as_str().unwrap());
+    let person = env
+        .ok("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+    assert_eq!(person["session"], "user-u1");
+    assert_eq!(person["replaced_previous"], false);
+
+    // The instance's session is untouched and still works as the server client.
+    assert_eq!(
+        std::fs::read_to_string(env.state_file("sessions/instance.json")).unwrap(),
+        instance_file
+    );
+    env.ok(
+        "signin.token",
+        json!({"session": "instance", "force": true}),
+    )
+    .await;
+    let refresh = env.fake.requests_to("/oauth/token").pop().unwrap();
+    let f: std::collections::HashMap<String, String> = refresh.form_fields().into_iter().collect();
+    assert_eq!(f["client_id"], "server-client");
+    let list = env.ok("signin.list", json!({})).await;
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_by_user_name_taken_by_another_client_gets_its_own_session() {
+    let env = Env::new();
+    // Another client's session happens to be called user-u1.
+    let b = env
+        .ok(
+            "signin.browser.begin",
+            json!({"client": "server", "server_client_id": "server-client",
+                   "session": "user-u1", "redirect_uri": SERVER_CALLBACK}),
+        )
+        .await;
+    let callback = env.fake.approve(b["authorize_url"].as_str().unwrap());
+    env.ok("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+    let b = env
+        .ok(
+            "signin.browser.begin",
+            json!({"redirect_uri": SERVER_CALLBACK}),
+        )
+        .await;
+    let callback = env.fake.approve(b["authorize_url"].as_str().unwrap());
+    let person = env
+        .ok("signin.browser.finish", json!({"callback_url": callback}))
+        .await;
+    let handle = person["session"].as_str().unwrap();
+    assert!(
+        handle.starts_with("user-u1-") && handle.len() > "user-u1-".len(),
+        "{handle}"
+    );
+}
+
+#[tokio::test]
+async fn in_fake_mode_a_loopback_sign_in_leaves_the_instance_session_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = json!({
+        "state_dir": dir.path().join("state").to_str().unwrap(),
+        "issuer": "fake:",
+        "client_id": "desktop-client",
+        "server_client_id": "server-client",
+        "scopes": "openid offline_access",
+    });
+    let call = |command: &str, extra: Value| {
+        let mut input = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            input[k] = v.clone();
+        }
+        let command = command.to_string();
+        async move { cli::run(&command, input, FakeMeros::new()).await }
+    };
+    let b = call(
+        "signin.browser.begin",
+        json!({"client": "server", "session": "instance", "redirect_uri": SERVER_CALLBACK}),
+    )
+    .await;
+    let page = call(
+        "fake.authorize",
+        json!({"authorize_url": b.output["authorize_url"]}),
+    )
+    .await;
+    let done = call(
+        "signin.browser.finish",
+        json!({"callback_url": page.output["callback_url"]}),
+    )
+    .await;
+    assert_eq!(done.output["session"], "instance", "{}", done.output);
+    let instance = dir.path().join("state/sessions/instance.json");
+    let before = std::fs::read_to_string(&instance).unwrap();
+
+    let lb = call("signin.browser.loopback", json!({"open": false})).await;
+    assert_eq!(lb.output["session"], "user-u1", "{}", lb.output);
+    assert_eq!(lb.output["replaced_previous"], false);
+    assert_eq!(std::fs::read_to_string(&instance).unwrap(), before);
+    let again = call("signin.browser.loopback", json!({"open": false})).await;
+    assert_eq!(again.output["session"], "user-u1");
+    let status = call("signin.status", json!({"session": "instance"})).await;
+    assert_eq!(status.output["signed_in"], true);
+}

@@ -216,8 +216,10 @@ the call exits 1 with `invalid_response`.
     `server.activate_login`.
 - `session` picks where the sign-in is kept. By default:
   - for people, `by_user`: one session per person, the one already signed in
-    as that `sub`, else a new `user-{sub}`. Later calls act as them with
-    `sub`;
+    as that `sub` under the same client, else a new `user-{sub}` (with a
+    suffix when another client's session has that name). A person's
+    sign-in never lands in the instance's session, or any other client's,
+    even for the same `sub`. Later calls act as them with `sub`;
   - for the server client, `server`.
 
   Any other handle is used as given.

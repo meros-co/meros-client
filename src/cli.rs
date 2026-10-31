@@ -1428,16 +1428,31 @@ impl Ctx {
     /// The session a completed sign-in is kept in: `target`, or with
     /// `by_user` the session already signed in as that person, else a new
     /// `user-{sub}`.
-    fn session_for(&self, target: &str, user: &MerosUser) -> Result<String, Error> {
+    ///
+    /// Only a session of the same client is reused, so a person's sign-in
+    /// never replaces the instance's own (Server-client) session, or one
+    /// under another client, even for the same `sub`.
+    fn session_for(
+        &self,
+        target: &str,
+        user: &MerosUser,
+        client_id: &str,
+    ) -> Result<String, Error> {
         if target != "by_user" {
             return Ok(target.to_string());
         }
-        if let Some((h, _)) = self
-            .sessions()?
-            .into_iter()
-            .find(|(_, u)| u.as_ref().is_some_and(|u| u.id == user.id))
-        {
-            return Ok(h);
+        let state = self.state()?;
+        let client_of = |h: &str| {
+            state
+                .read_json(&format!("sessions/{h}.json"))
+                .and_then(|v| v.get("meros.client_id")?.as_str().map(str::to_string))
+        };
+        let sessions = self.sessions()?;
+        if let Some((h, _)) = sessions.iter().find(|(h, u)| {
+            u.as_ref().is_some_and(|u| u.id == user.id)
+                && client_of(h).as_deref() == Some(client_id)
+        }) {
+            return Ok(h.clone());
         }
         let sub: String = user
             .id
@@ -1451,7 +1466,17 @@ impl Ctx {
             })
             .take(64)
             .collect();
-        Ok(format!("user-{sub}"))
+        let handle = format!("user-{sub}");
+        // That name may be taken by a session of another client.
+        if sessions.iter().any(|(h, u)| *h == handle && u.is_some()) {
+            let tag: String = <sha2::Sha256 as sha2::Digest>::digest(client_id.as_bytes())
+                .iter()
+                .take(4)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            return Ok(format!("{handle}-{tag}"));
+        }
+        Ok(handle)
     }
 
     /// A MerosAuth over the session `handle`, as `client_id`.
@@ -1480,7 +1505,7 @@ impl Ctx {
 
     /// Keeps a finished sign-in in its session and describes it.
     async fn keep_sign_in(&self, s: NewSession, target: &str) -> Result<Value, Error> {
-        let handle = self.session_for(target, &s.user)?;
+        let handle = self.session_for(target, &s.user, &s.client_id)?;
         // The session file refreshes with the client the tokens belong to.
         let auth = self.auth_as(
             &self.opt("client_id").unwrap_or_else(|| s.client_id.clone()),
