@@ -1947,3 +1947,87 @@ async fn in_fake_mode_a_loopback_sign_in_leaves_the_instance_session_alone() {
     let status = call("signin.status", json!({"session": "instance"})).await;
     assert_eq!(status.output["signed_in"], true);
 }
+
+#[tokio::test]
+async fn a_console_registers_from_the_session_it_signed_in_with() {
+    let env = Env::new();
+    env.fake.state().credentials = Some(("pat@example.com".into(), "correct horse".into()));
+    let done = env
+        .ok(
+            "signin.password",
+            json!({"email": "pat@example.com", "password": "correct horse",
+                   "client_id": "console-client", "session": "console"}),
+        )
+        .await;
+    assert_eq!(done["session"], "console");
+    let r = env
+        .ok("device.register", json!({"session": "console"}))
+        .await;
+    assert_eq!(r["account_id"], PERSONAL);
+    // Its token, refreshed as its own client when needed.
+    env.fake.state().expire_access_tokens();
+    env.ok("signin.token", json!({"session": "console", "force": true}))
+        .await;
+    let refresh = env.fake.requests_to("/oauth/token").pop().unwrap();
+    let f: std::collections::HashMap<String, String> = refresh.form_fields().into_iter().collect();
+    assert_eq!(f["client_id"], "console-client");
+    let out = env
+        .ok("signin.signout", json!({"session": "console"}))
+        .await;
+    assert_eq!(out["device_registration"]["unregistered"], true);
+}
+
+#[test]
+fn fake_mode_calls_at_once_keep_each_others_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let input = |extra: Value| {
+        let mut input = json!({
+            "state_dir": state.to_str().unwrap(),
+            "issuer": "fake:",
+            "client_id": "client-1",
+            "scopes": "openid offline_access",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            input[k] = v.clone();
+        }
+        input
+    };
+    let call = |command: &str, extra: Value| -> Value {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(cli::run(command, input(extra), FakeMeros::new()))
+            .output
+    };
+    call(
+        "fake.set",
+        json!({"patch": {"credentials": ["pat@example.com", "pw"], "totp": "123456"}}),
+    );
+    // Eight consoles start a two-factor sign-in at once, each in its own
+    // session: every challenge must survive.
+    let challenges: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                s.spawn(move || {
+                    let out = call(
+                        "signin.password",
+                        json!({"email": "pat@example.com", "password": "pw", "session": format!("c{i}")}),
+                    );
+                    out["challenge"].as_str().expect("a challenge").to_string()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let fake = call("fake.state", json!({}));
+    assert_eq!(fake["state"]["challenges"].as_object().unwrap().len(), 8);
+    for (i, c) in challenges.iter().enumerate() {
+        let out = call(
+            "signin.password.two_factor",
+            json!({"challenge": c, "code": "123456", "session": format!("c{i}")}),
+        );
+        assert_eq!(out["status"], "signed_in", "{out}");
+    }
+}

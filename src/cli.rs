@@ -177,7 +177,7 @@ pub async fn run(command: &str, input: Value, transport: Arc<dyn Transport>) -> 
         Err(e) => return failure(e),
     };
     if command.starts_with("fake.") {
-        let Some((fake, path)) = &fake else {
+        let Some((fake, path, _)) = &fake else {
             return failure(bad_input("fake.* commands need `\"issuer\": \"fake:\"`."));
         };
         let result = fake_command(command, &input, fake);
@@ -190,17 +190,17 @@ pub async fn run(command: &str, input: Value, transport: Arc<dyn Transport>) -> 
         };
     }
     let transport: Arc<dyn Transport> = match &fake {
-        Some((f, _)) => f.clone(),
+        Some((f, ..)) => f.clone(),
         None => transport,
     };
-    let fake_service = fake.as_ref().map(|(f, _)| f.clone());
+    let fake_service = fake.as_ref().map(|(f, ..)| f.clone());
     let ctx = match Ctx::open(input, transport, fake_service, READ_ONLY.contains(&command)) {
         Ok(c) => c,
         Err(e) => return failure(e),
     };
     let result = ctx.dispatch(command).await;
     drop(ctx);
-    if let Some((f, path)) = &fake
+    if let Some((f, path, _)) = &fake
         && let Err(e) = save_fake(f, path)
     {
         return failure(e);
@@ -233,12 +233,15 @@ fn success(v: Value) -> Outcome {
 pub const FAKE_ISSUER: &str = "fake:";
 const FAKE_ORIGIN: &str = "https://fake.meros.test";
 
+/// The fake service, where it is kept, and the lock held until it's saved.
+type FakeService = (Arc<crate::fake::FakeMeros>, PathBuf, File);
+
 /// With `"issuer": "fake:"`, the service is a [`FakeMeros`] kept in
 /// `{state_dir}/fake.json`, so products can test the real binary with no
-/// network. Its issuer becomes [`FAKE_ORIGIN`].
-fn fake_mode(
-    input: &mut Map<String, Value>,
-) -> Result<Option<(Arc<crate::fake::FakeMeros>, PathBuf)>, Error> {
+/// network. Its issuer becomes [`FAKE_ORIGIN`]. The lock on `fake.lock` is
+/// held from the load to the save, so calls at once take turns rather than
+/// lose each other's changes.
+fn fake_mode(input: &mut Map<String, Value>) -> Result<Option<FakeService>, Error> {
     if input.get("issuer").and_then(|v| v.as_str()) != Some(FAKE_ISSUER) {
         return Ok(None);
     }
@@ -248,6 +251,15 @@ fn fake_mode(
         .filter(|d| !d.is_empty())
         .ok_or_else(|| bad_input("Fake mode keeps its service in `state_dir`; give one."))?;
     create_private_dir(Path::new(dir)).map_err(state_error)?;
+    // Its own lock file: the state directory's `lock` is taken again by the
+    // command itself.
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(Path::new(dir).join("fake.lock"))
+        .map_err(state_error)?;
+    lock.lock().map_err(state_error)?;
     let path = Path::new(dir).join("fake.json");
     let state = match fs::read(&path) {
         Ok(bytes) => {
@@ -262,7 +274,11 @@ fn fake_mode(
         }
     };
     input.insert("issuer".into(), json!(FAKE_ORIGIN));
-    Ok(Some((crate::fake::FakeMeros::with_state(state), path)))
+    Ok(Some((
+        crate::fake::FakeMeros::with_state(state),
+        path,
+        lock,
+    )))
 }
 
 fn save_fake(fake: &crate::fake::FakeMeros, path: &Path) -> Result<(), Error> {
@@ -1516,8 +1532,9 @@ impl Ctx {
 
     // ── Device registration (devices without a license seat) ──
 
-    /// `device.register` and `device.unregister`, as the Server session
-    /// (`session`, default `server`).
+    /// `device.register` and `device.unregister`, as any signed-in session
+    /// (`session`, default `server`) with its own client's token: the
+    /// instance's Server session, or the session a console signed in with.
     async fn registration(&self, op: &str) -> Result<Value, Error> {
         let state = self.state()?;
         let handle = self.session_or("server")?;
@@ -1529,7 +1546,7 @@ impl Ctx {
             return Err(Error::new(
                 None,
                 "no_sign_in",
-                format!("The {handle} session isn't signed in. Sign the instance in first."),
+                format!("The {handle} session isn't signed in. Sign in first."),
             ));
         }
         let cloud = MerosCloud::new(self.issuer()?, self.transport.clone(), auth);

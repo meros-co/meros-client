@@ -203,8 +203,10 @@ Returns `{device_id, pubkey, key_source}` and makes the key on first use.
 ### `device.register` and `device.unregister`
 
 For products whose devices hold no license seat. `device.register` records
-this device under the account of the user signed in to the Server session
-(`session`, default `server`; see Clients and sessions). A registered device
+this device under the account of the user signed in to `session` (default
+`server`, the instance's own session; a console passes the session it
+signed in with). The request carries that session's token, from the client
+the session signed in with. A registered device
 counts as known to meros.co: its pushed sign-ins may use public host names,
 and members of its account see no security warning.
 
@@ -721,7 +723,8 @@ real binary without writing its own fake.
 
 - The fake answers as `https://fake.meros.test`. Use the keys from
   `fake.keys` for `keys`.
-- It isn't for concurrent calls.
+- Calls at once take turns (a lock on `fake.lock` is held from loading the
+  fake to saving it), so none loses another's changes.
 - Delete `fake.json` to start over.
 
 ### Seeded data
