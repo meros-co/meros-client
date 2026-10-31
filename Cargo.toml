@@ -25,7 +25,7 @@ entitlement = ["dep:meros-entitlement"]
 fake = []
 # The `meros-client` command-line helper: JSON in, JSON out, for apps not
 # written in Rust.
-cli = ["reqwest", "tokio/rt", "tokio/time", "dep:chacha20poly1305", "fake"]
+cli = ["reqwest", "tokio/rt", "tokio/time", "dep:chacha20poly1305", "fake", "loopback"]
 
 [dependencies]
 base64 = "0.22"
@@ -57,6 +57,10 @@ required-features = ["cli", "fake"]
 [[test]]
 name = "auth"
 required-features = ["fake", "loopback"]
+
+[[test]]
+name = "signin"
+required-features = ["fake"]
 
 [[test]]
 name = "license"

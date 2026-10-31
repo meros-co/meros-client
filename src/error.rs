@@ -22,7 +22,9 @@ pub struct ConflictHead {
 /// `not_uploaded`, `version_conflict`, …), or one of the client's own:
 /// `network` (no response), `http_<status>` (a response with no code),
 /// `bad_response`, `no_device_identity`, `token_rejected`, `signed_out`,
-/// `state_mismatch`, `no_pending`, `upload_failed`, `download_failed`.
+/// `state_mismatch`, `unknown_request`, `issuer_mismatch`,
+/// `invalid_response`, `par_unsupported`, `device_unavailable`,
+/// `upload_failed`, `download_failed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     /// The HTTP status, when there was a response.

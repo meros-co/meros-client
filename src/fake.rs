@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::Error;
 use crate::cloud::file_hash;
 use crate::events::rfc3339_ms;
-use crate::http::{BoxFuture, HttpRequest, HttpResponse, Transport};
+use crate::http::{BoxFuture, HttpRequest, HttpResponse, Transport, unix_now};
 
 /// Where the fake's signed upload and download URLs point.
 pub const BUCKET_HOST: &str = "bucket.test";
@@ -204,7 +204,30 @@ pub struct FakeState {
     /// When the product's entitlement runs out (RFC 3339), listed in the
     /// entitlements answer; None lists it without an expiry.
     pub entitlement_expires_at: Option<String>,
-    codes: HashMap<String, (String, String)>,
+    /// Whether discovery lists a PAR endpoint (RFC 9126).
+    pub par: bool,
+    /// Whether authorization responses carry `iss` (RFC 9207).
+    pub authorize_iss: bool,
+    /// The user a browser or password sign-in signs in: `(sub, name, email)`.
+    pub browser_user: (String, String, String),
+    /// Clients allowed the password grant; empty allows every client.
+    pub password_clients: BTreeSet<String>,
+    /// Refuses the next password sign-ins with this status and code, such
+    /// as `(403, "email_not_verified")`.
+    pub password_refusal: Option<(u16, String)>,
+    /// Failed password sign-ins by email; ten lock the account.
+    pub password_failures: HashMap<String, u32>,
+    /// Pushed authorization requests by `request_uri`: the parameters and
+    /// when it runs out.
+    pub par_requests: HashMap<String, (HashMap<String, String>, i64)>,
+    /// Two-factor challenges: challenge → (email, tries left, expiry).
+    pub challenges: HashMap<String, (String, u32, i64)>,
+    /// Device signatures already taken; each is accepted once.
+    pub used_signatures: HashSet<String>,
+    /// Claims laid over every id_token, to test a client's checks (a
+    /// foreign `aud`, a wrong `nonce`, an old `exp`).
+    pub id_token_overrides: Map<String, Value>,
+    codes: HashMap<String, FakeCode>,
     /// The product a device-API request named, for the statements it gets.
     request_product: String,
     refresh: HashSet<String>,
@@ -270,6 +293,16 @@ impl Default for FakeState {
             sso_sub: "u1".into(),
             login_tokens: HashMap::new(),
             entitlement_expires_at: None,
+            par: true,
+            authorize_iss: true,
+            browser_user: ("u1".into(), "Pat".into(), "pat@example.com".into()),
+            password_clients: BTreeSet::new(),
+            password_refusal: None,
+            password_failures: HashMap::new(),
+            par_requests: HashMap::new(),
+            challenges: HashMap::new(),
+            used_signatures: HashSet::new(),
+            id_token_overrides: Map::new(),
             codes: HashMap::new(),
             request_product: "example-app".into(),
             refresh: HashSet::new(),
@@ -376,6 +409,32 @@ impl FakeState {
         )
     }
 
+    /// An id_token for the browser user. id_tokens carry real time, so
+    /// clients check them on their own clocks; the signature is a
+    /// placeholder, since clients take an id_token from the token endpoint
+    /// without verifying it.
+    fn id_token(&self, issuer: &str, client: &str, nonce: &str, amr: &[&str]) -> String {
+        let now = unix_now();
+        let (sub, name, email) = &self.browser_user;
+        let acr = if amr.contains(&"mfa") {
+            "urn:meros:acr:mfa"
+        } else {
+            "urn:meros:acr:pwd"
+        };
+        let mut claims = json!({
+            "iss": issuer, "aud": client, "sub": sub, "name": name, "email": email,
+            "nonce": nonce, "iat": now, "exp": now + 3600, "amr": amr, "acr": acr,
+        });
+        for (k, v) in &self.id_token_overrides {
+            claims[k] = v.clone();
+        }
+        format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
+    }
+
     fn tokens(&mut self) -> Value {
         let a = format!("at{}", self.next());
         let r = format!("rt{}", self.next());
@@ -385,6 +444,19 @@ impl FakeState {
         json!({"access_token": a, "token_type": "Bearer", "expires_in": 3600, "refresh_token": r})
     }
 }
+
+/// An authorization code waiting to be exchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct FakeCode {
+    challenge: String,
+    redirect_uri: String,
+    client_id: String,
+    nonce: String,
+    acr_values: Option<String>,
+}
+
+/// How long a pushed authorization request's `request_uri` lasts.
+pub const PAR_LIFETIME: i64 = 90;
 
 /// A device sign-in (RFC 8628) waiting at the fake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,20 +522,71 @@ impl FakeMeros {
 
     /// What the browser does on the authorize page: approve, and redirect
     /// back with a code.
+    /// With a pushed request (`request_uri`), its parameters are used, once.
     pub fn approve(&self, authorize_url: &str) -> String {
-        let u = url::Url::parse(authorize_url).expect("an authorize URL");
+        self.authorize(authorize_url, true)
+            .expect("an authorize URL the fake can answer")
+    }
+
+    /// The person cancels on the authorize page: the redirect carries
+    /// `error=access_denied`.
+    pub fn deny(&self, authorize_url: &str) -> String {
+        self.authorize(authorize_url, false)
+            .expect("an authorize URL the fake can answer")
+    }
+
+    /// The authorize page's answer: the redirect back, approved or
+    /// canceled; why it can't answer otherwise.
+    pub fn authorize(&self, authorize_url: &str, approved: bool) -> Result<String, String> {
+        let u = url::Url::parse(authorize_url).map_err(|_| "not a URL".to_string())?;
+        let issuer = u.origin().ascii_serialization();
         let q: HashMap<String, String> = u.query_pairs().into_owned().collect();
         let mut st = self.state();
-        let code = format!("code{}", st.next());
-        st.codes.insert(
-            code.clone(),
-            (q["code_challenge"].clone(), q["redirect_uri"].clone()),
-        );
-        let mut back = url::Url::parse(&q["redirect_uri"]).expect("a redirect URI");
-        back.query_pairs_mut()
-            .append_pair("code", &code)
-            .append_pair("state", &q["state"]);
-        back.to_string()
+        let q = match q.get("request_uri") {
+            Some(uri) => {
+                let (params, expires) = st
+                    .par_requests
+                    .remove(uri)
+                    .ok_or("no pushed request has that request_uri, or it was used")?;
+                if st.clock >= expires {
+                    return Err("the request_uri expired".into());
+                }
+                if params.get("client_id") != q.get("client_id") {
+                    return Err("the request_uri is another client's".into());
+                }
+                params
+            }
+            None => q,
+        };
+        let (Some(redirect), Some(state)) = (q.get("redirect_uri"), q.get("state")) else {
+            return Err("no redirect_uri or state".into());
+        };
+        let mut back = url::Url::parse(redirect).map_err(|_| "a bad redirect_uri".to_string())?;
+        {
+            let mut pairs = back.query_pairs_mut();
+            if approved {
+                let code = format!("code{}", st.next());
+                let get = |k: &str| q.get(k).cloned().unwrap_or_default();
+                st.codes.insert(
+                    code.clone(),
+                    FakeCode {
+                        challenge: get("code_challenge"),
+                        redirect_uri: get("redirect_uri"),
+                        client_id: get("client_id"),
+                        nonce: get("nonce"),
+                        acr_values: q.get("acr_values").cloned(),
+                    },
+                );
+                pairs.append_pair("code", &code);
+            } else {
+                pairs.append_pair("error", "access_denied");
+            }
+            pairs.append_pair("state", state);
+            if st.authorize_iss {
+                pairs.append_pair("iss", &issuer);
+            }
+        }
+        Ok(back.to_string())
     }
 
     /// Publishes `payload` as the next version of a pack. `entitled` packs
@@ -563,8 +686,14 @@ impl FakeMeros {
                     "token_endpoint": format!("{issuer}/oauth/token"),
                     "userinfo_endpoint": format!("{issuer}/oauth/userinfo"),
                     "revocation_endpoint": format!("{issuer}/oauth/revoke"),
-                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "grant_types_supported": ["authorization_code", "refresh_token",
+                        "urn:meros:params:oauth:grant-type:password"],
+                    "authorization_response_iss_parameter_supported": st.authorize_iss,
                 });
+                if st.par {
+                    d["pushed_authorization_request_endpoint"] =
+                        json!(format!("{issuer}/oauth/par"));
+                }
                 if st.device_grant {
                     d["device_authorization_endpoint"] =
                         json!(format!("{issuer}/oauth/device/code"));
@@ -609,6 +738,7 @@ impl FakeMeros {
                     }),
                 )
             }
+            ["oauth", "par"] if st.par && r.method == "POST" => par(&mut st, &r),
             ["oauth", "token"] => oauth_token(&mut st, &r, &issuer),
             ["v1", "feeds", product, pack, rest @ ..] if r.method == "GET" => {
                 let signed_in = r
@@ -666,15 +796,27 @@ fn oauth_token(st: &mut FakeState, r: &HttpRequest, issuer: &str) -> HttpRespons
     let f: HashMap<String, String> = r.form_fields().into_iter().collect();
     match f.get("grant_type").map(String::as_str) {
         Some("authorization_code") => {
-            let Some((challenge, redirect)) = f.get("code").and_then(|c| st.codes.remove(c)) else {
+            let Some(c) = f.get("code").and_then(|c| st.codes.remove(c)) else {
                 return err(400, "invalid_grant");
             };
             let verifier = f.get("code_verifier").cloned().unwrap_or_default();
             let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-            if expected != challenge || f.get("redirect_uri") != Some(&redirect) {
+            if expected != c.challenge
+                || f.get("redirect_uri") != Some(&c.redirect_uri)
+                || f.get("client_id") != Some(&c.client_id)
+            {
                 return err(400, "invalid_grant");
             }
-            let t = st.tokens();
+            let mut t = st.tokens();
+            if !c.nonce.is_empty() {
+                let mfa = c.acr_values.as_deref() == Some("urn:meros:acr:mfa");
+                let amr: &[&str] = if mfa {
+                    &["pwd", "otp", "mfa"]
+                } else {
+                    &["pwd"]
+                };
+                t["id_token"] = json!(st.id_token(issuer, &c.client_id, &c.nonce, amr));
+            }
             reply(200, t)
         }
         Some("refresh_token") => {
@@ -718,6 +860,7 @@ fn oauth_token(st: &mut FakeState, r: &HttpRequest, issuer: &str) -> HttpRespons
             ));
             reply(200, t)
         }
+        Some("urn:meros:params:oauth:grant-type:password") => password_grant(st, r, &f, issuer),
         Some("urn:ietf:params:oauth:grant-type:device_code") => {
             let code = f.get("device_code").cloned().unwrap_or_default();
             let clock = st.clock;
@@ -749,6 +892,191 @@ fn oauth_token(st: &mut FakeState, r: &HttpRequest, issuer: &str) -> HttpRespons
         }
         _ => err(400, "unsupported_grant_type"),
     }
+}
+
+/// An OAuth-style refusal, as `/oauth/*` sends them.
+fn oauth_err(status: u16, code: &str, description: &str) -> HttpResponse {
+    reply(
+        status,
+        json!({"error": code, "error_description": description}),
+    )
+}
+
+/// Checks a signed sign-in request: `sig` over
+/// `POST|{path}|{device_id}|{ts}|{hex sha256 of the body before sig}`, each
+/// signature once. A known (activated) device must sign with its stored key.
+/// Returns whether the device is known.
+fn signed_body(st: &mut FakeState, r: &HttpRequest, path: &str) -> Result<bool, HttpResponse> {
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    let bad = |why: &str| oauth_err(401, "bad_signature", why);
+    let Some((before, sig)) = body.rsplit_once("&sig=") else {
+        return Err(bad("unsigned"));
+    };
+    let f: HashMap<String, String> = url::form_urlencoded::parse(before.as_bytes())
+        .into_owned()
+        .collect();
+    let id = f.get("device_id").cloned().unwrap_or_default();
+    let pubkey = f.get("device_pubkey").cloned().unwrap_or_default();
+    let ts: i64 = f.get("ts").and_then(|t| t.parse().ok()).unwrap_or(0);
+    let known = st.devices.get(&id).cloned();
+    if known.as_ref().is_some_and(|k| *k != pubkey) {
+        return Err(bad("another key"));
+    }
+    let hash: String = Sha256::digest(before.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let verified = (|| {
+        let key: [u8; 32] = URL_SAFE_NO_PAD.decode(&pubkey).ok()?.try_into().ok()?;
+        let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig).ok()?).ok()?;
+        VerifyingKey::from_bytes(&key)
+            .ok()?
+            .verify(format!("POST|{path}|{id}|{ts}|{hash}").as_bytes(), &sig)
+            .ok()
+    })()
+    .is_some();
+    if id.is_empty() || !verified {
+        return Err(bad("bad signature"));
+    }
+    if (ts - st.clock).abs() > 600 && (ts - unix_now()).abs() > 600 {
+        return Err(bad("stale"));
+    }
+    if !st.used_signatures.insert(sig.to_string()) {
+        return Err(bad("replayed"));
+    }
+    Ok(known.is_some())
+}
+
+/// Whether a redirect host is on the local network: private IPv4, IPv6
+/// ULA, `.local`, `.lan`, `.internal`, `.home.arpa` or a single label.
+fn local_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(ip) => ip.is_private() || ip.is_loopback(),
+        url::Host::Ipv6(ip) => (ip.segments()[0] & 0xfe00) == 0xfc00 || ip.is_loopback(),
+        url::Host::Domain(d) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            !d.contains('.')
+                || [".local", ".lan", ".internal", ".home.arpa"]
+                    .iter()
+                    .any(|s| d.ends_with(s))
+        }
+    }
+}
+
+/// `POST /oauth/par` (RFC 9126), device-signed. https redirects only, exact,
+/// no fragment or userinfo, no public IP literal; an unknown device may use
+/// local-network hosts only.
+fn par(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
+    let known = match signed_body(st, r, "/oauth/par") {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let f: HashMap<String, String> = r.form_fields().into_iter().collect();
+    for k in [
+        "client_id",
+        "redirect_uri",
+        "state",
+        "nonce",
+        "code_challenge",
+    ] {
+        if f.get(k).is_none_or(|v| v.is_empty()) {
+            return oauth_err(400, "invalid_request", &format!("{k} is required."));
+        }
+    }
+    let refused = |why: &str| oauth_err(400, "invalid_redirect_uri", why);
+    let Ok(u) = url::Url::parse(&f["redirect_uri"]) else {
+        return refused("not a URL");
+    };
+    if u.scheme() != "https" || u.fragment().is_some() || !u.username().is_empty() {
+        return refused("https only, with no fragment or userinfo");
+    }
+    let Some(host) = u.host() else {
+        return refused("no host");
+    };
+    let ip_literal = !matches!(host, url::Host::Domain(_));
+    if ip_literal && !local_host(&host) {
+        return refused("public IP addresses are refused");
+    }
+    if !known && !local_host(&host) {
+        return refused("an unknown device may use local-network addresses only");
+    }
+    let uri = format!("urn:ietf:params:oauth:request_uri:par{}", st.next());
+    let expires = st.clock + PAR_LIFETIME;
+    st.par_requests.insert(uri.clone(), (f, expires));
+    reply(201, json!({"request_uri": uri, "expires_in": PAR_LIFETIME}))
+}
+
+/// The password grant, device-signed: email and password, then the
+/// two-factor code when the account has it on (`totp`).
+fn password_grant(
+    st: &mut FakeState,
+    r: &HttpRequest,
+    f: &HashMap<String, String>,
+    issuer: &str,
+) -> HttpResponse {
+    if let Err(e) = signed_body(st, r, "/oauth/token") {
+        return e;
+    }
+    let client = f.get("client_id").cloned().unwrap_or_default();
+    if !st.password_clients.is_empty() && !st.password_clients.contains(&client) {
+        return oauth_err(400, "unauthorized_client", "Not allowed for this client.");
+    }
+    let nonce = f.get("nonce").cloned().unwrap_or_default();
+    let clock = st.clock;
+    let signed_in = |st: &mut FakeState, amr: &[&str]| {
+        let mut t = st.tokens();
+        t["id_token"] = json!(st.id_token(issuer, &client, &nonce, amr));
+        reply(200, t)
+    };
+    if let Some(challenge) = f.get("challenge") {
+        let Some((email, tries, expires)) = st.challenges.get(challenge).cloned() else {
+            return oauth_err(400, "invalid_challenge", "Start again.");
+        };
+        if clock >= expires || tries == 0 {
+            st.challenges.remove(challenge);
+            return oauth_err(400, "invalid_challenge", "Start again.");
+        }
+        if st.totp.as_deref() != f.get("code").map(String::as_str) {
+            st.challenges
+                .insert(challenge.clone(), (email, tries - 1, expires));
+            return oauth_err(400, "bad_code", "That code is not right.");
+        }
+        st.challenges.remove(challenge);
+        return signed_in(st, &["pwd", "otp", "mfa"]);
+    }
+    let email = f
+        .get("email")
+        .map(|e| e.trim().to_lowercase())
+        .unwrap_or_default();
+    if st.password_failures.get(&email).copied().unwrap_or(0) >= 10 {
+        return oauth_err(423, "account_locked", "Too many tries. Try again later.");
+    }
+    let good = st
+        .credentials
+        .as_ref()
+        .is_some_and(|(e, p)| e.to_lowercase() == email && Some(p) == f.get("password"));
+    if !good {
+        *st.password_failures.entry(email).or_default() += 1;
+        return oauth_err(400, "bad_credentials", "Email or password is incorrect.");
+    }
+    st.password_failures.remove(&email);
+    if let Some((status, code)) = st.password_refusal.clone() {
+        return oauth_err(status, &code, "Refused.");
+    }
+    if st.totp.is_some() {
+        let challenge = format!("ch{}", st.next());
+        st.challenges
+            .insert(challenge.clone(), (email, 5, clock + 300));
+        return reply(
+            400,
+            json!({
+                "error": "two_factor_required",
+                "error_description": "Enter the code from your authenticator app.",
+                "challenge": challenge, "expires_in": 300, "methods": ["totp", "recovery"],
+            }),
+        );
+    }
+    signed_in(st, &["pwd"])
 }
 
 /// `GET /v1/feeds/{product}/{pack}[/versions]`: packs signed with the
@@ -1494,10 +1822,10 @@ fn cloud(
 ) -> HttpResponse {
     let body = r.json_body().unwrap_or(Value::Null);
     match (r.method.as_str(), segs) {
-        ("GET", ["oauth", "userinfo"]) => reply(
-            200,
-            json!({"sub": "u1", "name": "Pat", "email": "pat@example.com"}),
-        ),
+        ("GET", ["oauth", "userinfo"]) => {
+            let (sub, name, email) = &st.browser_user;
+            reply(200, json!({"sub": sub, "name": name, "email": email}))
+        }
         ("GET", ["v1", "inventory", product]) => {
             if !st.features.contains(&format!("{product}.inventory")) {
                 return err(403, "not_entitled");

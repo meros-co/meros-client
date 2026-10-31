@@ -19,6 +19,15 @@ pub trait DeviceSigner: Send + Sync {
     /// base64url Ed25519 signature over `"{method}|{path}|{device_id}|{ts}"`,
     /// or None when the identity is unavailable.
     fn sign(&self, method: &str, path: &str, ts: i64) -> Option<String>;
+
+    /// base64url Ed25519 signature over `message` itself, for requests whose
+    /// signed string carries more than those four fields (the sign-in
+    /// requests add a body hash). None when the key's holder signs only the
+    /// four-field form; those requests then fail with `device_unavailable`.
+    fn sign_message(&self, message: &str) -> Option<String> {
+        let _ = message;
+        None
+    }
 }
 
 /// A [`DeviceSigner`] that also keeps the entitlement and describes the
@@ -194,6 +203,10 @@ pub mod testing {
         fn sign(&self, method: &str, path: &str, ts: i64) -> Option<String> {
             let input = format!("{method}|{path}|{}|{ts}", self.id);
             Some(URL_SAFE_NO_PAD.encode(self.key.sign(input.as_bytes()).to_bytes()))
+        }
+
+        fn sign_message(&self, message: &str) -> Option<String> {
+            Some(URL_SAFE_NO_PAD.encode(self.key.sign(message.as_bytes()).to_bytes()))
         }
     }
 

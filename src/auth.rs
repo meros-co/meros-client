@@ -1,11 +1,14 @@
 //! "Sign in with Meros": OAuth 2.0 authorization code with PKCE (S256), a
-//! rotating refresh token kept in the app's [`TokenStore`], and sign-out by
-//! revocation. Mobile apps redirect to their own scheme; desktop apps use a
-//! loopback redirect (RFC 8252, see [`crate::loopback`]). Devices with no
-//! browser sign in with the device authorization grant (RFC 8628): they show
-//! a code and a link, and the person approves it on another device. A
-//! service whose user signed in elsewhere redeems the login token minted
-//! there ([`MerosAuth::begin_login_token_sign_in`]).
+//! nonce and a checked id_token, a rotating refresh token kept in the app's
+//! [`TokenStore`], and sign-out by revocation. Mobile apps redirect to their
+//! own scheme; desktop apps use a loopback redirect (RFC 8252, see
+//! [`crate::loopback`]); servers push the request signed with their device
+//! key (RFC 9126) and redirect to their own https address. Consoles sign in
+//! with an email and password ([`MerosAuth::password_sign_in`]), or as the
+//! alternative where typing is hard, with the device authorization grant
+//! (RFC 8628): they show a code and a link, and the person approves it on
+//! another device. A service whose user signed in elsewhere redeems the
+//! login token minted there ([`MerosAuth::begin_login_token_sign_in`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Error;
+use crate::device::DeviceSigner;
 use crate::http::{BoxFuture, HttpRequest, Transport, unix_now, with_query};
 
 /// Where an app signs in and what it asks for.
@@ -128,6 +132,8 @@ fn string_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D:
     })
 }
 
+/// The single pending sign-in older versions kept; still read once so a
+/// sign-in begun before an upgrade can finish.
 #[derive(Serialize, Deserialize)]
 struct Pending {
     state: String,
@@ -135,6 +141,122 @@ struct Pending {
     #[serde(default)]
     redirect_uri: Option<String>,
 }
+
+/// A browser sign-in waiting for its callback, by state.
+#[derive(Serialize, Deserialize, Clone)]
+struct BrowserPending {
+    verifier: String,
+    /// Empty for a sign-in begun before nonces were sent.
+    #[serde(default)]
+    nonce: String,
+    redirect_uri: String,
+    client_id: String,
+    expires_at: i64,
+    #[serde(default)]
+    acr_values: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+}
+
+/// How long a browser sign-in waits for its callback, and how many may
+/// wait at once.
+const BROWSER_PENDING_SECS: i64 = 600;
+const BROWSER_PENDING_MAX: usize = 32;
+
+/// What a browser sign-in asks for ([`MerosAuth::begin_browser_sign_in`]).
+#[derive(Clone, Default)]
+pub struct BrowserSignInOptions {
+    /// Where meros.co sends the browser back: a loopback
+    /// `http://127.0.0.1:{port}/callback` on desktop, a server's own https
+    /// callback, or empty for the configured app-scheme redirect.
+    pub redirect_uri: String,
+    /// Such as `urn:meros:acr:mfa`, to require a two-factor sign-in.
+    pub acr_values: Option<String>,
+    /// The email to fill in on the sign-in page.
+    pub login_hint: Option<String>,
+    /// Such as `login`, to ask for the password even when the browser is
+    /// already signed in to meros.co.
+    pub prompt: Option<String>,
+    /// Pushes the request to the issuer's PAR endpoint, signed with this
+    /// device's key (RFC 9126), and leaves only its `request_uri` on the
+    /// authorize URL. Server products' clients require it.
+    pub device: Option<Arc<dyn DeviceSigner>>,
+    /// Kept with the pending sign-in and handed back when it finishes.
+    pub context: Option<String>,
+}
+
+/// A browser sign-in begun: send the browser to [`authorize_url`] and
+/// finish with the callback within [`expires_at`].
+///
+/// [`authorize_url`]: Self::authorize_url
+/// [`expires_at`]: Self::expires_at
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSignIn {
+    pub authorize_url: String,
+    pub state: String,
+    /// When the pending sign-in is forgotten, unix seconds.
+    pub expires_at: i64,
+}
+
+/// A completed sign-in not yet kept in any session: hand it to
+/// [`MerosAuth::adopt`] on the session it belongs to.
+pub struct NewSession {
+    pub user: MerosUser,
+    /// The client the tokens belong to; the session refreshes and revokes
+    /// with it.
+    pub client_id: String,
+    /// The id_token's `acr`, such as `urn:meros:acr:mfa`.
+    pub acr: Option<String>,
+    /// The id_token's `amr`, such as `["pwd", "otp", "mfa"]`.
+    pub amr: Vec<String>,
+    /// What the sign-in was begun with in
+    /// [`BrowserSignInOptions::context`].
+    pub context: Option<String>,
+    tokens: Tokens,
+}
+
+impl std::fmt::Debug for NewSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewSession")
+            .field("user", &self.user)
+            .field("client_id", &self.client_id)
+            .field("acr", &self.acr)
+            .field("amr", &self.amr)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A sign-in kept in a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedIn {
+    pub user: MerosUser,
+    /// Whether a different user was signed in to the session before (they
+    /// were signed out on the service first).
+    pub replaced_previous: bool,
+    pub acr: Option<String>,
+    pub amr: Vec<String>,
+}
+
+/// The first answer to a password sign-in.
+#[derive(Debug)]
+pub enum PasswordStep {
+    SignedIn(NewSession),
+    /// The account has two-factor on: ask for a code and finish with
+    /// [`MerosAuth::two_factor_sign_in`].
+    TwoFactor(TwoFactorChallenge),
+}
+
+/// A two-factor step waiting for its code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TwoFactorChallenge {
+    pub challenge: String,
+    /// What the code may be: `totp`, `recovery`.
+    pub methods: Vec<String>,
+    /// When the challenge runs out, unix seconds.
+    pub expires_at: i64,
+}
+
+const PASSWORD_GRANT: &str = "urn:meros:params:oauth:grant-type:password";
 
 /// The issuer's endpoints, from its discovery document
 /// (`{issuer}/.well-known/openid-configuration`).
@@ -149,6 +271,13 @@ pub struct Discovery {
     pub revocation_endpoint: Option<String>,
     #[serde(default)]
     pub device_authorization_endpoint: Option<String>,
+    /// Where signed pushed authorization requests go (RFC 9126).
+    #[serde(default)]
+    pub pushed_authorization_request_endpoint: Option<String>,
+    /// Whether the issuer puts `iss` on its authorization responses (RFC
+    /// 9207); a callback without it is then refused.
+    #[serde(default)]
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 /// A device sign-in in progress (RFC 8628): show [`user_code`] and
@@ -217,6 +346,9 @@ const USER_KEY: &str = "meros.user";
 const PENDING_KEY: &str = "meros.pending";
 const ACCESS_KEY: &str = "meros.access_token";
 const LOGIN_PENDING_KEY: &str = "meros.login_pending";
+const BROWSER_PENDING_KEY: &str = "meros.browser_pending";
+/// The client a session's tokens belong to, when it isn't the configured one.
+const CLIENT_KEY: &str = "meros.client_id";
 
 #[derive(Serialize, Deserialize)]
 struct KeptAccess {
@@ -510,11 +642,7 @@ impl MerosAuth {
     ) -> Result<(MerosUser, bool), Error> {
         let mut all = self.login_pending().await;
         let Some(pending) = all.get(request_id).cloned() else {
-            return Err(Error::new(
-                None,
-                "unknown_request",
-                "This sign-in was not begun here, or it expired. Begin it again.",
-            ));
+            return Err(unknown_request());
         };
         let scope = self.config.scopes.join(" ");
         let result = self
@@ -530,27 +658,44 @@ impl MerosAuth {
             all.remove(request_id);
             self.keep_login_pending(&all).await;
         }
-        let t = result?;
-        let issuer = self.discover().await.ok().map(|d| d.issuer);
+        let session = self
+            .accept(result?, &self.config.client_id, &pending.nonce, None)
+            .await?;
+        let s = self.adopt(session).await;
+        Ok((s.user, s.replaced_previous))
+    }
+
+    /// Checks a token response from a sign-in and reads who signed in. The
+    /// id_token must be for `client_id`, carry `nonce` and a subject, be
+    /// unexpired and come from this issuer, and a refresh token must come
+    /// with it; otherwise the tokens are revoked and it fails with
+    /// `invalid_response`.
+    async fn accept(
+        &self,
+        t: Tokens,
+        client_id: &str,
+        nonce: &str,
+        context: Option<String>,
+    ) -> Result<NewSession, Error> {
+        let issuer = self
+            .discover()
+            .await
+            .ok()
+            .map(|d| d.issuer)
+            .unwrap_or_else(|| self.config.issuer.clone());
         let claims = t
             .id_token
             .as_deref()
             .and_then(jwt_claims)
             .unwrap_or(serde_json::Value::Null);
-        let problem = id_token_problem(
-            &claims,
-            &self.config.client_id,
-            &pending.nonce,
-            issuer.as_deref(),
-            (self.now)(),
-        )
-        .or_else(|| {
-            t.refresh_token
-                .is_none()
-                .then_some("no refresh token was returned")
-        });
+        let problem = id_token_problem(&claims, client_id, nonce, Some(&issuer), (self.now)())
+            .or_else(|| {
+                t.refresh_token
+                    .is_none()
+                    .then_some("no refresh token was returned")
+            });
         if let Some(why) = problem {
-            self.revoke(&t.access_token).await;
+            self.revoke_as(&t.access_token, client_id).await;
             return Err(Error::new(
                 None,
                 "invalid_response",
@@ -558,14 +703,42 @@ impl MerosAuth {
             ));
         }
         let text = |k: &str| claims[k].as_str().unwrap_or_default().to_string();
-        let user = MerosUser {
+        let mut user = MerosUser {
             id: text("sub"),
             name: text("name"),
             email: text("email"),
         };
+        if user.name.is_empty() && user.email.is_empty() {
+            // An id_token without profile claims: the profile is at userinfo.
+            if let Ok(u) = self.userinfo(&t.access_token).await
+                && u.id == user.id
+            {
+                user = u;
+            }
+        }
+        Ok(NewSession {
+            user,
+            client_id: client_id.to_string(),
+            acr: claims["acr"].as_str().map(str::to_string),
+            amr: claims["amr"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            context,
+            tokens: t,
+        })
+    }
+
+    /// Keeps a completed sign-in as this session. A different user signed in
+    /// here before is signed out on the service first.
+    pub async fn adopt(&self, session: NewSession) -> SignedIn {
         self.load().await;
         let previous = self.user();
-        let replaced = previous.as_ref().is_some_and(|p| p.id != user.id);
+        let replaced = previous.as_ref().is_some_and(|p| p.id != session.user.id);
         if replaced {
             let access = self.session.lock().unwrap().access.clone();
             let token = match access {
@@ -576,7 +749,11 @@ impl MerosAuth {
                 self.revoke(&token).await;
             }
         }
-        self.keep(t).await;
+        let client =
+            (session.client_id != self.config.client_id).then(|| session.client_id.clone());
+        self.store.write(CLIENT_KEY, client).await;
+        self.keep(session.tokens).await;
+        let user = session.user;
         self.store
             .write(USER_KEY, serde_json::to_string(&user).ok())
             .await;
@@ -586,20 +763,38 @@ impl MerosAuth {
             s.loaded = true;
         }
         self.user_changed(Some(user.clone()));
-        Ok((user, replaced))
+        SignedIn {
+            user,
+            replaced_previous: replaced,
+            acr: session.acr,
+            amr: session.amr,
+        }
     }
 
-    /// Revokes `token` (RFC 7009) with this client's id; Meros revokes
+    /// The client this session's tokens belong to.
+    async fn session_client(&self) -> String {
+        self.store
+            .read(CLIENT_KEY)
+            .await
+            .unwrap_or_else(|| self.config.client_id.clone())
+    }
+
+    /// Revokes `token` (RFC 7009) with this session's client id; Meros revokes
     /// nothing without it. Best effort: true when the service answered
     /// (it always answers 200), false when it couldn't be reached.
     async fn revoke(&self, token: &str) -> bool {
+        let client = self.session_client().await;
+        self.revoke_as(token, &client).await
+    }
+
+    async fn revoke_as(&self, token: &str, client_id: &str) -> bool {
         let revoke = self
             .endpoint_for(|d| d.revocation_endpoint.clone(), "/oauth/revoke")
             .await;
         self.transport
             .send(
                 HttpRequest::new("POST", revoke)
-                    .form(&[("token", token), ("client_id", &self.config.client_id)]),
+                    .form(&[("token", token), ("client_id", client_id)]),
             )
             .await
             .is_ok_and(|r| r.ok())
@@ -649,39 +844,191 @@ impl MerosAuth {
     }
 
     /// The page to open in the browser, redirecting to `redirect_uri` (a
-    /// loopback `http://127.0.0.1:{port}/…` on desktop). The state, verifier
-    /// and redirect are stored, so the callback completes even if the app
-    /// was closed meanwhile.
+    /// loopback `http://127.0.0.1:{port}/…` on desktop). The sign-in waits,
+    /// stored, so the callback completes even if the app was closed
+    /// meanwhile. [`begin_browser_sign_in`](Self::begin_browser_sign_in)
+    /// takes more options.
     pub async fn begin_sign_in_with(&self, redirect_uri: &str) -> String {
+        let options = BrowserSignInOptions {
+            redirect_uri: redirect_uri.to_string(),
+            ..Default::default()
+        };
+        // Without a device the authorize URL is made here; nothing can fail.
+        self.begin_browser_sign_in(&options)
+            .await
+            .map(|b| b.authorize_url)
+            .unwrap_or_default()
+    }
+
+    /// Begins a browser sign-in (authorization code with PKCE S256, a nonce
+    /// and state). Up to 32 wait at once, each for ten minutes; the oldest
+    /// goes first. With [`BrowserSignInOptions::device`], the request is
+    /// pushed to the issuer signed with the device key, and fails with the
+    /// issuer's refusal (`invalid_redirect_uri`, `unauthorized_client`,
+    /// `bad_signature`, `rate_limited`) or `par_unsupported`.
+    pub async fn begin_browser_sign_in(
+        &self,
+        options: &BrowserSignInOptions,
+    ) -> Result<BrowserSignIn, Error> {
+        let redirect_uri = if options.redirect_uri.is_empty() {
+            self.config.redirect_uri.clone()
+        } else {
+            options.redirect_uri.clone()
+        };
         let pkce = Pkce::generate();
         let state = random_unreserved(32);
-        let pending = Pending {
-            state: state.clone(),
-            verifier: pkce.verifier.clone(),
-            redirect_uri: Some(redirect_uri.to_string()),
-        };
-        self.store
-            .write(PENDING_KEY, serde_json::to_string(&pending).ok())
-            .await;
+        let nonce = random_unreserved(22);
         let scope = self.config.scopes.join(" ");
+        let mut params: Vec<(&str, &str)> = vec![
+            ("client_id", &self.config.client_id),
+            ("response_type", "code"),
+            ("redirect_uri", &redirect_uri),
+            ("scope", &scope),
+            ("state", &state),
+            ("nonce", &nonce),
+            ("code_challenge", &pkce.challenge),
+            ("code_challenge_method", "S256"),
+        ];
+        for (k, v) in [
+            ("acr_values", &options.acr_values),
+            ("login_hint", &options.login_hint),
+            ("prompt", &options.prompt),
+        ] {
+            if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+                params.push((k, v));
+            }
+        }
         let authorize = self
             .endpoint_for(
                 |d| Some(d.authorization_endpoint.clone()),
                 "/oauth/authorize",
             )
             .await;
-        with_query(
-            &authorize,
-            &[
-                ("response_type", "code"),
-                ("client_id", &self.config.client_id),
-                ("redirect_uri", redirect_uri),
-                ("scope", &scope),
-                ("state", &state),
-                ("code_challenge", &pkce.challenge),
-                ("code_challenge_method", "S256"),
-            ],
-        )
+        let authorize_url = match &options.device {
+            None => with_query(&authorize, &params),
+            Some(device) => {
+                let endpoint = self
+                    .discover()
+                    .await?
+                    .pushed_authorization_request_endpoint
+                    .ok_or_else(|| {
+                        Error::new(
+                            None,
+                            "par_unsupported",
+                            "This sign-in service does not take pushed sign-in requests.",
+                        )
+                    })?;
+                let r = self
+                    .transport
+                    .send(self.signed_form(device.as_ref(), &endpoint, &params)?)
+                    .await?;
+                if !r.ok() {
+                    return Err(Error::from_response(&r));
+                }
+                #[derive(Deserialize)]
+                struct Pushed {
+                    request_uri: String,
+                }
+                let p: Pushed = r.parse()?;
+                with_query(
+                    &authorize,
+                    &[
+                        ("client_id", &self.config.client_id),
+                        ("request_uri", &p.request_uri),
+                    ],
+                )
+            }
+        };
+        let expires_at = (self.now)() + BROWSER_PENDING_SECS;
+        let mut all = self.browser_pending().await;
+        while all.len() >= BROWSER_PENDING_MAX {
+            let oldest = all
+                .iter()
+                .min_by_key(|(_, p)| p.expires_at)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
+            all.remove(&oldest);
+        }
+        all.insert(
+            state.clone(),
+            BrowserPending {
+                verifier: pkce.verifier,
+                nonce,
+                redirect_uri,
+                client_id: self.config.client_id.clone(),
+                expires_at,
+                acr_values: options.acr_values.clone(),
+                context: options.context.clone(),
+            },
+        );
+        self.keep_browser_pending(&all).await;
+        Ok(BrowserSignIn {
+            authorize_url,
+            state,
+            expires_at,
+        })
+    }
+
+    /// A form body signed with the device key over
+    /// `POST|{path}|{device_id}|{ts}|{hex sha256 of the body before sig}`,
+    /// with `sig` last. Each call signs afresh: the issuer takes a signature
+    /// once.
+    fn signed_form(
+        &self,
+        device: &dyn DeviceSigner,
+        endpoint: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<HttpRequest, Error> {
+        let id = device.identity().ok_or_else(Error::no_identity)?;
+        let ts = (self.now)().to_string();
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(fields)
+            .append_pair("device_id", &id.id)
+            .append_pair("device_pubkey", &id.pubkey)
+            .append_pair("ts", &ts)
+            .finish();
+        let path = url::Url::parse(endpoint)
+            .map(|u| u.path().to_string())
+            .unwrap_or_default();
+        let hash: String = Sha256::digest(body.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let sig = device
+            .sign_message(&format!("POST|{path}|{}|{ts}|{hash}", id.id))
+            .ok_or_else(|| {
+                Error::new(
+                    None,
+                    "device_unavailable",
+                    "This device's key can't sign sign-in requests.",
+                )
+            })?;
+        // base64url needs no escaping.
+        let mut r = HttpRequest::new("POST", endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded");
+        r.body = format!("{body}&sig={sig}").into_bytes();
+        Ok(r)
+    }
+
+    async fn browser_pending(&self) -> std::collections::BTreeMap<String, BrowserPending> {
+        let now = (self.now)();
+        let mut all: std::collections::BTreeMap<String, BrowserPending> = self
+            .store
+            .read(BROWSER_PENDING_KEY)
+            .await
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        all.retain(|_, p| p.expires_at > now);
+        all
+    }
+
+    async fn keep_browser_pending(&self, all: &std::collections::BTreeMap<String, BrowserPending>) {
+        let value = if all.is_empty() {
+            None
+        } else {
+            serde_json::to_string(all).ok()
+        };
+        self.store.write(BROWSER_PENDING_KEY, value).await;
     }
 
     /// Whether `uri` is this app's sign-in callback (its scheme, host and
@@ -696,10 +1043,30 @@ impl MerosAuth {
         u.scheme() == r.scheme() && u.host_str() == r.host_str() && u.path() == r.path()
     }
 
-    /// Finishes signing in from the redirect back to the app.
+    /// Finishes signing in from the redirect back to the app, and keeps the
+    /// session here.
     pub async fn complete_sign_in(&self, callback: &str) -> Result<MerosUser, Error> {
-        let pending = self.store.read(PENDING_KEY).await;
-        self.store.write(PENDING_KEY, None).await;
+        Ok(self.complete_browser_sign_in(callback).await?.user)
+    }
+
+    /// [`finish_browser_sign_in`](Self::finish_browser_sign_in), then
+    /// [`adopt`](Self::adopt) here.
+    pub async fn complete_browser_sign_in(&self, callback: &str) -> Result<SignedIn, Error> {
+        let session = self.finish_browser_sign_in(callback).await?;
+        Ok(self.adopt(session).await)
+    }
+
+    /// Checks the redirect back from the sign-in page and exchanges its code,
+    /// without keeping the session anywhere yet. The state must be one
+    /// waiting here (each finishes once), `iss` must be this issuer, the
+    /// code is exchanged with the stored verifier and redirect, and the
+    /// id_token is checked (for this client, with the nonce, unexpired, from
+    /// this issuer, with a refresh token). Refusals:
+    /// the issuer's `error` (`access_denied` when the person canceled),
+    /// `unknown_request`, `state_mismatch`, `issuer_mismatch`,
+    /// `invalid_grant`, `invalid_response`. Offline, the sign-in keeps
+    /// waiting for a retry.
+    pub async fn finish_browser_sign_in(&self, callback: &str) -> Result<NewSession, Error> {
         let url = url::Url::parse(callback)
             .map_err(|_| Error::new(None, "state_mismatch", "That sign-in link is not valid."))?;
         let q = |k: &str| {
@@ -707,48 +1074,189 @@ impl MerosAuth {
                 .find(|(n, _)| n == k)
                 .map(|(_, v)| v.into_owned())
         };
+        let state = q("state").unwrap_or_default();
+        let mut all = self.browser_pending().await;
+        let pending = match all.remove(&state) {
+            Some(p) => Some(p),
+            None => self.legacy_pending(&state).await,
+        };
+        self.keep_browser_pending(&all).await;
         if let Some(error) = q("error") {
             let message = if error == "access_denied" {
                 "Sign-in was canceled.".to_string()
             } else {
-                format!("Sign-in failed ({error}).")
+                q("error_description").unwrap_or_else(|| format!("Sign-in failed ({error})."))
             };
             return Err(Error::new(None, error, message));
         }
-        let pending: Pending = pending
-            .and_then(|p| serde_json::from_str(&p).ok())
-            .ok_or_else(|| {
-                Error::new(
-                    None,
-                    "no_pending",
-                    "Sign-in was not started here. Try again.",
-                )
-            })?;
-        let code = q("code");
-        if q("state").as_deref() != Some(pending.state.as_str()) || code.is_none() {
+        let Some(pending) = pending else {
+            return Err(unknown_request());
+        };
+        let discovery = self.discover().await.ok();
+        let issuer = discovery
+            .as_ref()
+            .map(|d| d.issuer.clone())
+            .unwrap_or_else(|| self.config.issuer.clone());
+        let iss_required = discovery
+            .as_ref()
+            .is_some_and(|d| d.authorization_response_iss_parameter_supported);
+        match q("iss") {
+            Some(iss) if iss != issuer => return Err(issuer_mismatch()),
+            None if iss_required => return Err(issuer_mismatch()),
+            _ => {}
+        }
+        let Some(code) = q("code") else {
             return Err(Error::new(
                 None,
                 "state_mismatch",
                 "That sign-in link does not match. Try again.",
             ));
-        }
-        let redirect = pending
-            .redirect_uri
-            .unwrap_or_else(|| self.config.redirect_uri.clone());
-        let access = self
-            .token(&[
+        };
+        let result = self
+            .token_response(&[
                 ("grant_type", "authorization_code"),
-                ("code", &code.unwrap()),
-                ("redirect_uri", &redirect),
-                ("client_id", &self.config.client_id),
+                ("code", &code),
+                ("redirect_uri", &pending.redirect_uri),
+                ("client_id", &pending.client_id),
                 ("code_verifier", &pending.verifier),
             ])
-            .await?;
-        self.signed_in_with(&access).await
+            .await;
+        if matches!(&result, Err(e) if e.offline()) {
+            let mut all = self.browser_pending().await;
+            all.insert(state, pending.clone());
+            self.keep_browser_pending(&all).await;
+        }
+        let t = result?;
+        if pending.nonce.is_empty() {
+            // Begun before nonces were sent: the profile comes from userinfo.
+            let user = self.userinfo(&t.access_token).await?;
+            return Ok(NewSession {
+                user,
+                client_id: pending.client_id,
+                acr: None,
+                amr: Vec::new(),
+                context: pending.context,
+                tokens: t,
+            });
+        }
+        self.accept(t, &pending.client_id, &pending.nonce, pending.context)
+            .await
     }
 
-    /// Reads the account behind a new access token and stores the session.
-    async fn signed_in_with(&self, access: &str) -> Result<MerosUser, Error> {
+    /// The single pending sign-in older versions kept, if it has `state`.
+    async fn legacy_pending(&self, state: &str) -> Option<BrowserPending> {
+        let raw = self.store.read(PENDING_KEY).await?;
+        self.store.write(PENDING_KEY, None).await;
+        let p: Pending = serde_json::from_str(&raw).ok()?;
+        (p.state == state).then(|| BrowserPending {
+            verifier: p.verifier,
+            nonce: String::new(),
+            redirect_uri: p
+                .redirect_uri
+                .unwrap_or_else(|| self.config.redirect_uri.clone()),
+            client_id: self.config.client_id.clone(),
+            expires_at: 0,
+            acr_values: None,
+            context: None,
+        })
+    }
+
+    /// Signs in with an email and password, for consoles: the device grant's
+    /// alternative where typing is possible. The request is signed with the
+    /// device key, and the client must be allowed the password grant. The
+    /// password is sent once and kept nowhere. Refusals: `bad_credentials`,
+    /// `email_not_verified`, `team_requires_two_factor`, `account_locked`,
+    /// `rate_limited`, `unauthorized_client`, `bad_signature`.
+    pub async fn password_sign_in(
+        &self,
+        device: &dyn DeviceSigner,
+        email: &str,
+        password: &str,
+    ) -> Result<PasswordStep, Error> {
+        let scope = self.config.scopes.join(" ");
+        self.password_grant(
+            device,
+            &[
+                ("email", email),
+                ("password", password),
+                ("scope", scope.as_str()),
+            ],
+        )
+        .await
+    }
+
+    /// Finishes a password sign-in's two-factor step with the person's code
+    /// (an authenticator code or a recovery code). Refusals: `bad_code`
+    /// (try again; the challenge allows five tries), `invalid_challenge`
+    /// (start over), `account_locked`, `rate_limited`.
+    pub async fn two_factor_sign_in(
+        &self,
+        device: &dyn DeviceSigner,
+        challenge: &str,
+        code: &str,
+    ) -> Result<NewSession, Error> {
+        let code = code.trim().replace(' ', "");
+        match self
+            .password_grant(device, &[("challenge", challenge), ("code", &code)])
+            .await?
+        {
+            PasswordStep::SignedIn(s) => Ok(s),
+            PasswordStep::TwoFactor(_) => Err(Error::new(
+                None,
+                "invalid_response",
+                "The sign-in service asked for a second code again.",
+            )),
+        }
+    }
+
+    async fn password_grant(
+        &self,
+        device: &dyn DeviceSigner,
+        fields: &[(&str, &str)],
+    ) -> Result<PasswordStep, Error> {
+        let nonce = random_unreserved(22);
+        let mut form = vec![
+            ("grant_type", PASSWORD_GRANT),
+            ("client_id", self.config.client_id.as_str()),
+        ];
+        form.extend_from_slice(fields);
+        form.push(("nonce", &nonce));
+        let endpoint = self
+            .endpoint_for(|d| Some(d.token_endpoint.clone()), "/oauth/token")
+            .await;
+        let r = self
+            .transport
+            .send(self.signed_form(device, &endpoint, &form)?)
+            .await?;
+        if r.status != 200 {
+            let body = r.value();
+            if r.error_code().as_deref() == Some("two_factor_required")
+                && let Some(challenge) = body["challenge"].as_str()
+            {
+                return Ok(PasswordStep::TwoFactor(TwoFactorChallenge {
+                    challenge: challenge.to_string(),
+                    methods: body["methods"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    expires_at: (self.now)() + body["expires_in"].as_i64().unwrap_or(300),
+                }));
+            }
+            return Err(Error::from_response(&r));
+        }
+        let t: Tokens = r.parse()?;
+        let client = self.config.client_id.clone();
+        Ok(PasswordStep::SignedIn(
+            self.accept(t, &client, &nonce, None).await?,
+        ))
+    }
+
+    /// The account behind an access token.
+    async fn userinfo(&self, access: &str) -> Result<MerosUser, Error> {
         let userinfo = self
             .endpoint_for(|d| d.userinfo_endpoint.clone(), "/oauth/userinfo")
             .await;
@@ -767,7 +1275,14 @@ impl MerosAuth {
                 "Could not read the account.",
             ));
         }
-        let user: MerosUser = info.parse()?;
+        info.parse()
+    }
+
+    /// Reads the account behind a new access token from the device grant
+    /// (the configured client) and stores the session.
+    async fn signed_in_with(&self, access: &str) -> Result<MerosUser, Error> {
+        let user = self.userinfo(access).await?;
+        self.store.write(CLIENT_KEY, None).await;
         self.store
             .write(USER_KEY, serde_json::to_string(&user).ok())
             .await;
@@ -811,11 +1326,12 @@ impl MerosAuth {
         let Some(refresh) = self.store.read(REFRESH_KEY).await else {
             return Err(Error::new(None, "signed_out", "Not signed in."));
         };
+        let client = self.session_client().await;
         let result = self
             .token(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh),
-                ("client_id", &self.config.client_id),
+                ("client_id", &client),
             ])
             .await;
         if let Err(e) = &result {
@@ -903,6 +1419,7 @@ impl MerosAuth {
         };
         self.store.write(REFRESH_KEY, None).await;
         self.store.write(USER_KEY, None).await;
+        self.store.write(CLIENT_KEY, None).await;
         if self.keep_access {
             self.store.write(ACCESS_KEY, None).await;
         }
@@ -967,6 +1484,22 @@ fn id_token_problem(
         return Some("the id_token is from a different issuer");
     }
     None
+}
+
+fn unknown_request() -> Error {
+    Error::new(
+        None,
+        "unknown_request",
+        "This sign-in was not begun here, or it expired. Begin it again.",
+    )
+}
+
+fn issuer_mismatch() -> Error {
+    Error::new(
+        None,
+        "issuer_mismatch",
+        "That sign-in came back from a different sign-in service.",
+    )
 }
 
 fn no_discovery(status: Option<u16>) -> Error {

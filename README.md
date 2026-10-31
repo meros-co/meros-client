@@ -7,7 +7,7 @@ Flutter apps call it from their Rust core through flutter_rust_bridge.
 | Module | What it does |
 |---|---|
 | `license` | The device license API: activate with a key, renew, release, claim a seat by signing in (with TOTP), claim and list or release seats with the app's own sign-in, adopt an unowned license (guest or App Store purchase) into the account after sign-in (`adopt_after_sign_in`), App Store redeem, "manage online" and browser-claim links, offline activation blobs, and `activate`/`claim` deep links |
-| `auth` | Sign in with Meros: authorization code with PKCE (S256), the device authorization grant (RFC 8628), rotating refresh tokens kept in the app's `TokenStore`, and sign-out by revocation. Endpoints come from the issuer's discovery document |
+| `auth` | Sign in with Meros: authorization code with PKCE (S256), a nonce and checked id_tokens, several sign-ins waiting at once, pushed authorization requests signed with the device key (RFC 9126) for servers, the console password grant with two-factor, the device authorization grant (RFC 8628) for consoles, rotating refresh tokens kept in the app's `TokenStore`, and sign-out by revocation. Endpoints come from the issuer's discovery document |
 | `server` | Server licenses: activate an instance with a key or a Meros login (which adopts an unowned key), renew daily with `410` vs `403` told apart, release and move, and verify the perpetual Server statement (`verify_licence`). No offline activation |
 | `loopback` | The desktop loopback redirect (RFC 8252). Feature `loopback` |
 | `cloud` | Meros Cloud: profiles, versioned documents, files (signed-URL upload and checked download), accounts, entitlements, device inventory, login tokens for connected services, and signed data-pack feeds (`MerosFeeds`, verified offline with `verify_pack`) |
@@ -114,8 +114,44 @@ auth.complete_sign_in(&callback).await?;
 # Ok(()) }
 ```
 
-On a device with no browser, sign in with a code approved on another device
-(RFC 8628):
+A server with a web UI pushes the sign-in, signed with its device key, and
+finishes it with the verifier only it holds. Each person can keep a session
+of their own: `finish_browser_sign_in` returns the sign-in without keeping
+it, and `adopt` keeps it in the session it belongs to.
+
+```rust,ignore
+# async fn run(auth: &meros_client::MerosAuth, device: std::sync::Arc<dyn meros_client::DeviceSigner>) -> Result<(), meros_client::Error> {
+use meros_client::BrowserSignInOptions;
+let begun = auth
+    .begin_browser_sign_in(&BrowserSignInOptions {
+        redirect_uri: "https://rack.lan:8443/auth/meros/callback".into(),
+        device: Some(device),
+        ..Default::default()
+    })
+    .await?;
+// set a cookie with `begun.state`, redirect the browser to `begun.authorize_url`,
+// and when it comes back (after checking the cookie):
+# let callback = begun.authorize_url;
+let signed_in = auth.complete_browser_sign_in(&callback).await?;
+# Ok(()) }
+```
+
+A console signs in with an email and password, with the two-factor step
+when the account has it on:
+
+```rust,ignore
+# async fn run(auth: &meros_client::MerosAuth, device: &dyn meros_client::DeviceSigner) -> Result<(), meros_client::Error> {
+use meros_client::PasswordStep;
+let new = match auth.password_sign_in(device, "pat@example.com", "…").await? {
+    PasswordStep::SignedIn(new) => new,
+    PasswordStep::TwoFactor(c) => auth.two_factor_sign_in(device, &c.challenge, "123456").await?,
+};
+auth.adopt(new).await;
+# Ok(()) }
+```
+
+As the alternative on a console where typing is hard, sign in with a code
+approved on another device (RFC 8628):
 
 ```rust,ignore
 # async fn run(auth: &meros_client::MerosAuth) -> Result<(), meros_client::Error> {
@@ -139,7 +175,8 @@ code either way.
 `cargo test --all-features` runs everything against `FakeMeros`. It checks
 device signatures for real, and the tests cover:
 
-- PKCE, the device grant and refresh rotation;
+- PKCE, pushed requests, id_token checks, the password grant, the device
+  grant and refresh rotation;
 - seats, claim refusals, token expiry and the file quota;
 - damaged uploads;
 - document conflicts;

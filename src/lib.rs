@@ -48,8 +48,9 @@ pub mod cli;
 pub mod fake;
 
 pub use auth::{
-    AccessTokenSource, AuthConfig, DeviceSignIn, Discovery, LoginTokenRequest, MemoryTokenStore,
-    MerosAuth, MerosUser, Pkce, StaticToken, TokenStore,
+    AccessTokenSource, AuthConfig, BrowserSignIn, BrowserSignInOptions, DeviceSignIn, Discovery,
+    LoginTokenRequest, MemoryTokenStore, MerosAuth, MerosUser, NewSession, PasswordStep, Pkce,
+    SignedIn, StaticToken, TokenStore, TwoFactorChallenge,
 };
 pub use cloud::{
     FeedResponse, MerosAccount, MerosCloud, MerosDoc, MerosDocInfo, MerosDocVersion, MerosFeeds,

@@ -41,17 +41,20 @@ async fn a_tampered_or_foreign_callback_is_refused() {
     let fake = FakeMeros::new();
     let a = auth(&fake);
     let page = a.begin_sign_in().await;
-    let callback = fake.approve(&page).replace("state=", "state=x");
+    let callback = fake.approve(&page);
+    let tampered = callback.replace("state=", "state=x");
     assert_eq!(
-        a.complete_sign_in(&callback).await.unwrap_err().code,
-        "state_mismatch"
+        a.complete_sign_in(&tampered).await.unwrap_err().code,
+        "unknown_request"
     );
-    // The pending sign-in is used up.
-    let e = a
-        .complete_sign_in("exampleapp://oauth/callback?code=c&state=s")
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, "no_pending");
+    // A foreign issuer is refused, and the sign-in is used up.
+    let foreign = callback.replace("iss=https", "iss=http");
+    assert_eq!(
+        a.complete_sign_in(&foreign).await.unwrap_err().code,
+        "issuer_mismatch"
+    );
+    let e = a.complete_sign_in(&callback).await.unwrap_err();
+    assert_eq!(e.code, "unknown_request");
     let e = a
         .complete_sign_in("exampleapp://oauth/callback?error=access_denied")
         .await
@@ -309,7 +312,8 @@ async fn endpoints_come_from_discovery() {
         1
     );
     assert_eq!(fake.requests_to("/oauth/token").len(), 2);
-    assert_eq!(fake.requests_to("/oauth/userinfo").len(), 1);
+    // The id_token carries the profile.
+    assert_eq!(fake.requests_to("/oauth/userinfo").len(), 0);
     assert_eq!(fake.requests_to("/oauth/revoke").len(), 1);
 }
 
