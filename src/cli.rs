@@ -117,8 +117,17 @@ pub const COMMANDS: &[&str] = &[
     "support.thread",
     "support.reply",
     "events.send",
+    "events.relay",
     "events.flush",
     "events.clear",
+    "fake.keys",
+    "fake.state",
+    "fake.set",
+    "fake.approve_device",
+    "fake.deny_device",
+    "fake.publish_pack",
+    "fake.support_reply",
+    "fake.advance",
 ];
 
 /// Commands that only read the state directory.
@@ -154,23 +163,192 @@ pub async fn run(command: &str, input: Value, transport: Arc<dyn Transport>) -> 
             format!("Unknown command: {command}. Run `meros-client commands` for the list."),
         ));
     }
+    let mut input = input;
+    let fake = match fake_mode(&mut input) {
+        Ok(f) => f,
+        Err(e) => return failure(e),
+    };
+    if command.starts_with("fake.") {
+        let Some((fake, path)) = &fake else {
+            return failure(bad_input("fake.* commands need `\"issuer\": \"fake:\"`."));
+        };
+        let result = fake_command(command, &input, fake);
+        if let Err(e) = save_fake(fake, path) {
+            return failure(e);
+        }
+        return match result {
+            Ok(v) => success(v),
+            Err(e) => failure(e),
+        };
+    }
+    let transport: Arc<dyn Transport> = match &fake {
+        Some((f, _)) => f.clone(),
+        None => transport,
+    };
     let ctx = match Ctx::open(input, transport, READ_ONLY.contains(&command)) {
         Ok(c) => c,
         Err(e) => return failure(e),
     };
-    match ctx.dispatch(command).await {
-        Ok(Value::Object(mut out)) => {
+    let result = ctx.dispatch(command).await;
+    drop(ctx);
+    if let Some((f, path)) = &fake
+        && let Err(e) = save_fake(f, path)
+    {
+        return failure(e);
+    }
+    match result {
+        Ok(v) => success(v),
+        Err(e) => failure(e),
+    }
+}
+
+fn success(v: Value) -> Outcome {
+    match v {
+        Value::Object(mut out) => {
             out.insert("ok".into(), json!(true));
             Outcome {
                 exit: exit::OK,
                 output: Value::Object(out),
             }
         }
-        Ok(other) => Outcome {
+        other => Outcome {
             exit: exit::OK,
             output: json!({"ok": true, "result": other}),
         },
-        Err(e) => failure(e),
+    }
+}
+
+// ───────────────────────────── Fake mode ─────────────────────────────
+
+/// The issuer that selects fake mode, and the origin the fake answers as.
+pub const FAKE_ISSUER: &str = "fake:";
+const FAKE_ORIGIN: &str = "https://fake.meros.test";
+
+/// With `"issuer": "fake:"`, the service is a [`FakeMeros`] kept in
+/// `{state_dir}/fake.json`, so products can test the real binary with no
+/// network. Its issuer becomes [`FAKE_ORIGIN`].
+fn fake_mode(
+    input: &mut Map<String, Value>,
+) -> Result<Option<(Arc<crate::fake::FakeMeros>, PathBuf)>, Error> {
+    if input.get("issuer").and_then(|v| v.as_str()) != Some(FAKE_ISSUER) {
+        return Ok(None);
+    }
+    let dir = input
+        .get("state_dir")
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| bad_input("Fake mode keeps its service in `state_dir`; give one."))?;
+    create_private_dir(Path::new(dir)).map_err(state_error)?;
+    let path = Path::new(dir).join("fake.json");
+    let state = match fs::read(&path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| state_error(format!("fake.json: {e}")))?
+        }
+        Err(_) => {
+            // Seeded for the helper: real signed tokens, so they verify
+            // against `fake.keys`.
+            let mut s = crate::fake::FakeState::default();
+            s.signed_tokens = true;
+            s
+        }
+    };
+    input.insert("issuer".into(), json!(FAKE_ORIGIN));
+    Ok(Some((crate::fake::FakeMeros::with_state(state), path)))
+}
+
+fn save_fake(fake: &crate::fake::FakeMeros, path: &Path) -> Result<(), Error> {
+    let bytes = serde_json::to_vec_pretty(&*fake.state()).map_err(state_error)?;
+    write_private(path, &bytes).map_err(state_error)
+}
+
+/// The fake's controls, for tests driving the binary.
+fn fake_command(
+    command: &str,
+    input: &Map<String, Value>,
+    fake: &crate::fake::FakeMeros,
+) -> Result<Value, Error> {
+    let text = |k: &str| {
+        input
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| bad_input(format!("Missing input field `{k}`.")))
+    };
+    let table = |keys: Vec<(&str, String)>| -> Value {
+        keys.into_iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect::<Map<_, _>>()
+            .into()
+    };
+    match command {
+        "fake.keys" => Ok(json!({
+            "server": table(crate::fake::server_keys()),
+            "entitlement": table(crate::fake::entitlement_keys()),
+            "issuer": FAKE_ORIGIN,
+        })),
+        "fake.state" => {
+            Ok(json!({"state": serde_json::to_value(&*fake.state()).map_err(state_error)?}))
+        }
+        "fake.set" => {
+            let Some(Value::Object(patch)) = input.get("patch") else {
+                return Err(bad_input("`patch` must be an object of state fields."));
+            };
+            let mut st = fake.state();
+            let mut current = serde_json::to_value(&*st).map_err(state_error)?;
+            for (k, v) in patch {
+                if current.get(k).is_none() {
+                    return Err(bad_input(format!("The fake has no field `{k}`.")));
+                }
+                current[k] = v.clone();
+            }
+            let mint = st.mint.take();
+            let requests = std::mem::take(&mut st.requests);
+            *st = serde_json::from_value(current)
+                .map_err(|e| bad_input(format!("The patch doesn't fit the fake: {e}")))?;
+            st.mint = mint;
+            st.requests = requests;
+            Ok(json!({}))
+        }
+        "fake.approve_device" | "fake.deny_device" => {
+            let code = text("user_code")?;
+            if !fake
+                .state()
+                .device_sign_ins
+                .values()
+                .any(|d| d.user_code == code)
+            {
+                return Err(bad_input(format!("No device sign-in shows {code}.")));
+            }
+            if command == "fake.approve_device" {
+                fake.approve_device(&code);
+            } else {
+                fake.deny_device(&code);
+            }
+            Ok(json!({}))
+        }
+        "fake.publish_pack" => {
+            let entitled = input.get("entitled").and_then(|v| v.as_bool()) == Some(true);
+            fake.publish_pack(
+                &text("product")?,
+                &text("pack")?,
+                input.get("payload").cloned().unwrap_or(json!({})),
+                entitled,
+            );
+            Ok(json!({}))
+        }
+        "fake.support_reply" => {
+            fake.support_replies(&text("ticket_id")?, &text("message")?);
+            Ok(json!({}))
+        }
+        "fake.advance" => {
+            let secs = input
+                .get("seconds")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| bad_input("`seconds` must be an integer."))?;
+            fake.state().clock += secs;
+            Ok(json!({"clock": fake.state().clock}))
+        }
+        _ => unreachable!("checked against COMMANDS"),
     }
 }
 
@@ -898,11 +1076,18 @@ impl Ctx {
         ))
     }
 
-    fn license_client(&self, device: Arc<FileDevice>) -> Result<LicenseClient, Error> {
-        let base = match self.opt("device_base_url") {
+    /// The product's device base: `device_base_url`, else
+    /// `{issuer}/app/{product}`, where Meros serves device licensing and
+    /// device-signed support.
+    fn device_base(&self) -> Result<String, Error> {
+        Ok(match self.opt("device_base_url") {
             Some(b) => b.trim_end_matches('/').to_string(),
-            None => self.issuer()?,
-        };
+            None => format!("{}/app/{}", self.issuer()?, self.req("product")?),
+        })
+    }
+
+    fn license_client(&self, device: Arc<FileDevice>) -> Result<LicenseClient, Error> {
+        let base = self.device_base()?;
         Ok(LicenseClient::new(
             LicenseConfig {
                 base_url: base,
@@ -1655,10 +1840,7 @@ impl Ctx {
         let api = match self.opt("via").as_deref().unwrap_or("device") {
             "device" => {
                 let device = self.device()?;
-                let base = match self.opt("device_base_url") {
-                    Some(b) => b.trim_end_matches('/').to_string(),
-                    None => self.issuer()?,
-                };
+                let base = self.device_base()?;
                 Api::Device(SupportApi::new(
                     base,
                     self.opt("app_version").unwrap_or_default(),
@@ -1752,6 +1934,20 @@ impl Ctx {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         emitter.requeue(kept);
+        if op == "relay" {
+            let events = match self.input.get("events") {
+                Some(Value::Array(a)) => a.clone(),
+                _ => return Err(bad_input("`events` must be an array of envelopes.")),
+            };
+            for (i, e) in events.into_iter().enumerate() {
+                let envelope: Envelope = serde_json::from_value(e).map_err(|err| {
+                    bad_input(format!("events[{i}] is not an Envelope v1 event: {err}"))
+                })?;
+                emitter
+                    .relay(envelope)
+                    .map_err(|err| bad_input(format!("events[{i}]: {err}")))?;
+            }
+        }
         if op == "send" {
             let events = match self.input.get("events") {
                 Some(Value::Array(a)) => a.clone(),

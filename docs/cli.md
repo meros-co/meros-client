@@ -86,12 +86,12 @@ settings on every call, and add the command's own fields.
 | Field | Used by | Meaning |
 |---|---|---|
 | `state_dir` | all but `--version`/`commands` | The state directory (below). Created if missing, except by the read-only commands |
-| `issuer` | service calls | The service origin, e.g. the staging or production one. No trailing slash needed. Nothing is built in |
+| `issuer` | service calls | The service origin, e.g. the staging or production one. No trailing slash needed. Nothing is built in. `fake:` runs against a fake service instead (see Fake mode) |
 | `product` | server, cloud, support, events | The product id |
 | `app_name`, `app_version` | licensing, events | Used in the default device name and reported to the service |
 | `client_id`, `scopes` | sign-in | The app's public OAuth client and the scopes it asks for (array or space-separated string). Server activation with a login needs `licenses:activate`; refresh tokens need `offline_access` |
 | `keys` | licensing | The product's signing keys, `{"kid": "base64url Ed25519 public key"}`. Statements and tokens are verified against them before they're stored or reported |
-| `device_base_url` | device licensing, device support | The product's device base, if it isn't the service root |
+| `device_base_url` | device licensing, device support | The product's device base. Default `{issuer}/app/{product}`, where Meros serves both |
 | `model`, `device_name` | licensing | How the device appears on the service. `model` defaults to the OS and architecture |
 | `account_id` | cloud, server login | A team account; omitted means the user's default |
 | `session` | sign-in, cloud, server login, account support, events | Which identity to act as: a handle the caller picks (letters, digits, `_`, `-`). Default `default` |
@@ -448,6 +448,11 @@ key and needs an activated device license; `account` uses the signed-in user
 `status` is `open` (waiting on support), `pending` (support answered) or
 `closed`. Expect `rate_limited` and `too_many_open_tickets` refusals.
 
+`via: device` works for any device the service has registered for the
+product, so a Server instance activated with `server.activate` or
+`server.activate_login` files tickets as itself, the same as a device
+license.
+
 ## Events
 
 Meros Event Envelope v1, logged in `events/` and delivered to collectors.
@@ -484,6 +489,22 @@ failed}`. What isn't delivered stays in `events/outbox.json` and goes with
 the next `events.send` or `events.flush`, under the same ids. A collector
 that already took one counts it as a duplicate.
 
+### `events.relay`
+
+Forwards other products' events unchanged, for an app that collects events
+locally and passes them on.
+
+- Input: `events`, an array of complete Envelope v1 events (`envelope`, `id`,
+  `occurred_at`, `seq`, `source`, `type`, `severity`, and the optional
+  fields).
+- They go on exactly as given: same id, time, sequence and source. A
+  collector that already has one counts it as a duplicate.
+- They wait in the outbox, retry and clear like the app's own events, but
+  aren't written to its local log.
+- An event that isn't Envelope v1, lacks `id`, `occurred_at` or `type`, or
+  is over 64 KiB, is exit 3 (`bad_input`, naming its index).
+- Same output as `events.send`; `"flush": false` queues without sending.
+
 ### `events.flush`
 
 Delivers what's waiting. Same output.
@@ -494,6 +515,55 @@ Drops every event waiting in `events/outbox.json` without sending it. Use it
 when the app's user turns event reporting off, so nothing queued earlier
 leaves later. Returns `{cleared, pending: 0}`. Needs no `issuer` or
 `product`. The local log is kept.
+
+## Fake mode
+
+With `"issuer": "fake:"`, every command runs against an in-memory copy of
+the Meros services instead of the network. Its state lives in
+`{state_dir}/fake.json` between calls, so a product can test against the
+real binary without writing its own fake.
+
+- The fake answers as `https://fake.meros.test`. Use the keys from
+  `fake.keys` for `keys`.
+- It isn't for concurrent calls.
+- Delete `fake.json` to start over.
+
+### Seeded data
+
+| What | Value |
+|---|---|
+| The signed-in user | `sub` `u1`, name `Pat`, email `pat@example.com` |
+| Their personal account | `acct-personal` |
+| The clock | 2026-10-17 12:00 UTC, moved with `fake.advance` |
+| Device sign-in | 10-minute codes, a 5-second interval; approve with `fake.approve_device` |
+| Tokens | Access tokens last an hour; refresh tokens rotate and work once |
+| Entitlement tokens and Server statements | Signed with the keys in `fake.keys` |
+| Everything else | Empty: no license keys, features, packs or documents |
+
+### Controls
+
+| Command | Input | Does |
+|---|---|---|
+| `fake.keys` | | Returns `{server, entitlement}` key tables (kid → key) and the `issuer` |
+| `fake.state` | | Returns the whole state, to check what arrived (`events`, `tickets`, `docs`, `seats`, `inventory`) |
+| `fake.set` | `patch` | Sets state fields, e.g. `{"license_keys": ["KEY-1"], "server_keys": {"SRV-1": "acct-personal"}, "features": ["my-product.sync"], "free_seats": 2, "team": "acct-team"}`. An unknown field is refused |
+| `fake.approve_device` / `fake.deny_device` | `user_code` | Decides a pending device sign-in |
+| `fake.publish_pack` | `product`, `pack`, `payload`, `entitled?` | Publishes the next version of a pack |
+| `fake.support_reply` | `ticket_id`, `message` | Support answers a ticket |
+| `fake.advance` | `seconds` | Moves the clock, e.g. past a device code's expiry |
+
+Useful knobs for `fake.set`:
+
+- licensing:
+  - `license_keys` (device keys that activate);
+  - `server_keys` (Server key → owning account);
+  - `unowned_keys`;
+  - `suspended_keys` and `revoked_keys`;
+  - `free_seats`, `team`, `features`;
+  - `entitlement_expires_at` (RFC 3339);
+- sign-in: `device_grant` (false hides the grant), `sso_audiences`, `sso_sub`;
+- refusals: `support_rate_limited`, `open_ticket_cap`, `unknown_products`;
+- limits: `event_batch_cap`, `file_cap` and `file_quota`.
 
 ## Testing
 

@@ -1277,3 +1277,165 @@ async fn a_document_conflict_says_when_the_other_copy_was_saved() {
             .is_some_and(|t| t.starts_with("2026-"))
     );
 }
+
+#[tokio::test]
+async fn relayed_events_go_on_unchanged_and_a_resend_is_a_duplicate() {
+    let env = Env::new();
+    env.sign_in().await;
+    let envelope = json!({
+        "envelope": 1,
+        "id": "01JBX6YQ3Z8N4E2R7T5W9K0M1P",
+        "occurred_at": "2026-10-30T20:01:02.003Z",
+        "seq": 41,
+        "source": {"product": "other-app", "version": "3.1.0", "instance": "abcd1234ef567890"},
+        "type": "other-app.channel.muted",
+        "severity": "notice",
+        "attrs": {"channel": 7},
+    });
+    let sent = env
+        .ok("events.relay", json!({"events": [envelope.clone()]}))
+        .await;
+    assert_eq!(sent["accepted"], 1);
+    let got = env.fake.state().events[0].clone();
+    assert_eq!(got, envelope);
+    // The same event again: the collector already has it.
+    let again = env
+        .ok("events.relay", json!({"events": [envelope.clone()]}))
+        .await;
+    assert_eq!(
+        (again["accepted"].clone(), again["duplicates"].clone()),
+        (json!(0), json!(1))
+    );
+    // Undelivered relays wait in the outbox like any event, and clear.
+    env.ok(
+        "events.relay",
+        json!({"flush": false, "events": [envelope]}),
+    )
+    .await;
+    assert_eq!(env.ok("events.clear", json!({})).await["cleared"], 1);
+    let bad = env
+        .run("events.relay", json!({"events": [{"type": "x.y.z"}]}))
+        .await;
+    assert_eq!(bad.exit, exit::USAGE);
+}
+
+#[tokio::test]
+async fn a_server_activation_files_support_tickets_as_the_device() {
+    let env = Env::new();
+    env.fake
+        .state()
+        .server_keys
+        .insert("SRV-1".into(), PERSONAL.into());
+    env.ok("server.activate", json!({"license_key": "SRV-1"}))
+        .await;
+    let t = env
+        .ok(
+            "support.create",
+            json!({"subject": "Rack", "message": "Help."}),
+        )
+        .await;
+    assert_eq!(t["ticket"]["status"], "open");
+    // Device support goes to the product's device base.
+    let create = env.fake.requests_to("/v1/support/tickets");
+    assert!(
+        create[0]
+            .url
+            .starts_with(&format!("{ISSUER}/app/example-app/"))
+    );
+}
+
+#[test]
+fn fake_mode_runs_the_real_binary_with_no_network() {
+    let bin = env!("CARGO_BIN_EXE_meros-client");
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let call = |command: &str, extra: Value| -> (i32, Value) {
+        let mut input = json!({
+            "state_dir": state.to_str().unwrap(),
+            "issuer": "fake:",
+            "product": "my-product",
+            "client_id": "client-1",
+            "scopes": "openid offline_access",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            input[k] = v.clone();
+        }
+        let path = dir.path().join("in.json");
+        std::fs::write(&path, input.to_string()).unwrap();
+        let out = std::process::Command::new(bin)
+            .args([command, "--input", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap(),
+            serde_json::from_slice(&out.stdout).unwrap(),
+        )
+    };
+    let (_, keys) = call("fake.keys", json!({}));
+    let all_keys: serde_json::Map<String, Value> = keys["server"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .chain(keys["entitlement"].as_object().unwrap())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let keys = json!(all_keys);
+
+    // Sign in, approving the code on the fake.
+    let (code, start) = call("signin.start", json!({}));
+    assert_eq!(code, exit::OK, "{start}");
+    assert_eq!(start["verification_uri"], "https://fake.meros.test/link");
+    call(
+        "fake.approve_device",
+        json!({"user_code": start["user_code"]}),
+    );
+    let (_, done) = call("signin.poll", json!({}));
+    assert_eq!(done["status"], "signed_in");
+
+    // Seed keys through the knobs, then license both ways.
+    let (code, _) = call(
+        "fake.set",
+        json!({"patch": {"server_keys": {"SRV-1": "acct-personal"}, "license_keys": ["KEY-1"]}}),
+    );
+    assert_eq!(code, exit::OK);
+    let (code, a) = call(
+        "server.activate",
+        json!({"license_key": "SRV-1", "keys": keys}),
+    );
+    assert_eq!(code, exit::OK, "{a}");
+    assert_eq!(a["licence"]["product"], "my-product");
+    let (code, l) = call(
+        "license.activate",
+        json!({"license_key": "KEY-1", "keys": keys}),
+    );
+    assert_eq!(code, exit::OK, "{l}");
+    let (_, t) = call(
+        "support.create",
+        json!({"subject": "Hi", "message": "From the fake."}),
+    );
+    call(
+        "fake.support_reply",
+        json!({"ticket_id": t["ticket"]["id"], "message": "Hello."}),
+    );
+    let (_, list) = call("support.list", json!({}));
+    assert_eq!(list["tickets"][0]["status"], "pending");
+
+    // The fake's state is there to inspect between calls.
+    let (_, st) = call("fake.state", json!({}));
+    assert_eq!(st["state"]["tickets"].as_array().unwrap().len(), 1);
+    let (code, bad) = call("fake.set", json!({"patch": {"no_such_knob": 1}}));
+    assert_eq!(
+        (code, bad["error"]["code"].clone()),
+        (exit::USAGE, json!("bad_input"))
+    );
+    // Fake controls refuse a real issuer.
+    let mut input = json!({"state_dir": state.to_str().unwrap(), "issuer": "https://example.test"});
+    input["x"] = json!(1);
+    let path = dir.path().join("real.json");
+    std::fs::write(&path, input.to_string()).unwrap();
+    let out = std::process::Command::new(bin)
+        .args(["fake.state", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(exit::USAGE));
+}
