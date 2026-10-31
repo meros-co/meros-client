@@ -448,10 +448,9 @@ key and needs an activated device license; `account` uses the signed-in user
 `status` is `open` (waiting on support), `pending` (support answered) or
 `closed`. Expect `rate_limited` and `too_many_open_tickets` refusals.
 
-`via: device` works for any device the service has registered for the
-product, so a Server instance activated with `server.activate` or
-`server.activate_login` files tickets as itself, the same as a device
-license.
+`via: device` needs the product's device base, which Meros serves only for
+products with device licenses. A Server product has none: its instances
+file tickets with `via: account`, as the signed-in user.
 
 ## Events
 
