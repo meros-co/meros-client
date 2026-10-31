@@ -2050,3 +2050,59 @@ async fn a_failed_delivery_says_why() {
     assert_eq!(out["delivery_error"]["code"], "invalid_token");
     assert_eq!(out["delivery_error"]["status"], 401);
 }
+
+#[tokio::test]
+async fn instance_members_are_kept_and_verified_offline() {
+    let env = Env::new();
+    env.fake
+        .state()
+        .server_keys
+        .insert("SRV-1".into(), PERSONAL.into());
+    let (code, err) = env.refused("instance.members.verify", json!({})).await;
+    assert_eq!((code, err.as_str()), (exit::LOCAL, "not_activated"));
+    env.ok("server.activate", json!({"license_key": "SRV-1"}))
+        .await;
+    let (code, err) = env.refused("instance.members.verify", json!({})).await;
+    assert_eq!((code, err.as_str()), (exit::LOCAL, "not_cached"));
+
+    let m = env.ok("instance.members", json!({})).await;
+    assert_eq!(
+        (m["enabled"].clone(), m["cached"].clone()),
+        (json!(true), json!(false))
+    );
+    assert_eq!(m["members"][0]["sub"], "u1");
+    assert_eq!(m["members"][0]["role"], "admin");
+    assert_eq!(
+        m["expires_at"].as_i64().unwrap() - m["issued_at"].as_i64().unwrap(),
+        7 * 86_400
+    );
+    let again = env.ok("instance.members", json!({})).await;
+    assert_eq!(again["unchanged"], true);
+
+    // Offline: the last good statement, said to be cached.
+    let mut input = env.base();
+    input["product"] = json!("example-app");
+    let offline = cli::run("instance.members", input, Arc::new(Offline)).await;
+    assert_eq!(offline.exit, exit::OK, "{}", offline.output);
+    assert_eq!(offline.output["cached"], true);
+    assert_eq!(offline.output["version"], m["version"]);
+
+    // Verify, read-only, the kept one or a given one.
+    let v = env.ok("instance.members.verify", json!({})).await;
+    assert_eq!(
+        (v["expired"].clone(), v["members"][0]["sub"].clone()),
+        (json!(false), json!("u1"))
+    );
+    let kept: Value =
+        serde_json::from_str(&std::fs::read_to_string(env.state_file("members.json")).unwrap())
+            .unwrap();
+    let token = kept["statement"].as_str().unwrap();
+    let (payload, sig) = token.split_once('.').unwrap();
+    let tampered = format!("{}x.{sig}", &payload[..payload.len() - 1]);
+    let (code, err) = env
+        .refused("instance.members.verify", json!({"statement": tampered}))
+        .await;
+    assert_eq!((code, err.as_str()), (exit::LOCAL, "verify_failed"));
+    let (code, err) = env.refused("instance.members", json!({"keys": {}})).await;
+    assert_eq!((code, err.as_str()), (exit::USAGE, "bad_input"));
+}

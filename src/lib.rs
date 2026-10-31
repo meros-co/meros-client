@@ -34,6 +34,7 @@ pub mod environment;
 pub mod error;
 pub mod events;
 pub mod http;
+pub mod instance;
 pub mod license;
 pub mod server;
 pub mod support;
@@ -71,6 +72,9 @@ pub use events::{
 #[cfg(feature = "reqwest")]
 pub use http::ReqwestTransport;
 pub use http::{BoxFuture, HttpRequest, HttpResponse, Transport};
+pub use instance::{
+    InstanceClient, Member, MemberRole, MembersAnswer, MembersStatement, verify_members,
+};
 pub use license::{
     AuthResult, LicenseClient, LicenseConfig, LicenseLink, LicenseSeat, SignInClaim,
 };

@@ -68,6 +68,10 @@ name = "signin"
 required-features = ["fake"]
 
 [[test]]
+name = "instance"
+required-features = ["fake"]
+
+[[test]]
 name = "keychain"
 required-features = ["cli"]
 

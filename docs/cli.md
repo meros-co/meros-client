@@ -110,6 +110,7 @@ settings on every call, and add the command's own fields.
 | `signin/` | Browser sign-ins waiting for their callbacks, two-factor steps waiting for their codes, and the page a loopback sign-in is waiting on |
 | `server.json` | The Server statement and its feature token |
 | `device-registration.json` | The device's registration and the session that made it |
+| `members.json` | The last good members statement (Cloud-managed users) and its version |
 | `key-source.json` | Which key source the state directory was set up with (see Sealing with the OS keychain); nothing secret |
 | `license.json` | The device entitlement token |
 | `events/` | The local event log, the install's identity, and undelivered events (`outbox.json`) |
@@ -538,6 +539,50 @@ Verifies `statement` against `keys`, for `product` and the device (this
 state directory's, or `device_id` and `device_pubkey` given). Returns
 `{licence}`; exit 4 `verify_failed` otherwise. Read-only.
 
+## Cloud-managed users
+
+A Server instance owned by a team can take its users from Meros Cloud
+instead of managing them locally. The instance asks as itself: the request is
+a form signed with the device key, like a pushed sign-in, with no person's
+token. The instance must be known to Meros (activated, or registered).
+
+### `instance.members`
+
+Input: `product`, `keys` (the product's statement keys). Returns:
+
+```json
+{"enabled": true, "reason": null,
+ "account": {"id": "...", "name": "Crew"},
+ "roles": [{"id": "admin", "name": "Administrator"}, {"id": "operator", "name": "Operator"}],
+ "default_role": "operator", "admin_role": "admin",
+ "members": [{"sub": "...", "name": "Pat", "email": "pat@example.com",
+              "team_role": "owner", "role": "admin"}],
+ "version": "...", "issued_at": 1793470000, "expires_at": 1794074800,
+ "expired": false, "unchanged": false, "cached": false}
+```
+
+- `enabled` false means cloud users can't be used here now, and `reason`
+  says why: `personal_account`, `no_team_addon` or `gate_lapsed`.
+- A member whose `role` is null has no access. Accept a person only when
+  their `sub` is a member with a role, and apply that role.
+- The answer comes with a statement signed with the product key, which
+  lasts seven days. It is verified before anything is reported and kept in
+  `members.json`.
+- The kept version is sent each time: when nothing changed, the answer is
+  the same list with `unchanged: true` and a fresh statement.
+- Offline, the kept statement is reported with `cached: true`; with none
+  kept, the call exits 2. Run sessions on it only while `expired` is false.
+- Refusals: exit 1 `unknown_device` (not activated or registered),
+  `bad_signature`, `rate_limited`; exit 4 `verify_failed` for a statement
+  that doesn't verify.
+
+### `instance.members.verify`
+
+Verifies `statement`, or the kept one, offline, against `keys`, the product
+and this device. Returns the same view (without `unchanged` and `cached`).
+Exit 4 `not_cached` with nothing kept, `verify_failed` for a statement that
+doesn't verify. Read-only.
+
 ## Device licenses
 
 For apps that activate per device with a key or an account.
@@ -779,6 +824,8 @@ Useful knobs for `fake.set`:
   - `credentials` (`[email, password]`), `totp` (the code that passes),
     `password_clients`, `password_refusal` (`[status, code]`);
   - `id_token_overrides` (claims laid over every id_token);
+- cloud-managed users: `members_enabled`, `members_reason`, `member_roles`,
+  `instance_members` (the version follows their content);
   - `sso_audiences`, `sso_sub`;
 - device registration: `registered_devices` (id → `[pubkey, account]`),
   `devices_scope` (false refuses with `insufficient_scope`);

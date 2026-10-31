@@ -69,6 +69,8 @@ pub const COMMANDS: &[&str] = &[
     "device.identity",
     "device.register",
     "device.unregister",
+    "instance.members",
+    "instance.members.verify",
     "signin.start",
     "signin.poll",
     "signin.status",
@@ -145,6 +147,7 @@ pub const READ_ONLY: &[&str] = &[
     "license.status",
     "signin.status",
     "signin.list",
+    "instance.members.verify",
 ];
 
 const LOCAL_CODES: &[&str] = &[
@@ -1366,6 +1369,7 @@ impl Ctx {
                 }))
             }
             "device.register" | "device.unregister" => self.registration(&command[7..]).await,
+            c if c.starts_with("instance.") => self.instance(&c[9..]).await,
             c if c.starts_with("signin.") => self.signin(&c[7..]).await,
             c if c.starts_with("server.") => self.server(&c[7..]).await,
             c if c.starts_with("license.") => self.license(&c[8..]).await,
@@ -1525,6 +1529,88 @@ impl Ctx {
                         self.opt("acr_values").as_deref(),
                     )
                     .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ── Cloud-managed users ──
+
+    /// `instance.members` (asks the service as the instance, keeps the last
+    /// good statement) and `instance.members.verify` (checks a statement
+    /// offline).
+    async fn instance(&self, op: &str) -> Result<Value, Error> {
+        let product = self.req("product")?;
+        let keys = self.keys()?;
+        if keys.is_empty() {
+            return Err(bad_input(
+                "Members statements are verified against `keys`; give the product's keys.",
+            ));
+        }
+        let state = self.state()?;
+        let device = self.device()?;
+        let cached = state.read_json(MEMBERS);
+        let verify = |statement: &str| -> Result<crate::MembersStatement, Error> {
+            let table: Vec<(&str, &str)> =
+                keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            crate::verify_members(&table, statement, &product, &device.id, &device.pubkey())
+                .map_err(|e| {
+                    Error::new(
+                        None,
+                        "verify_failed",
+                        format!("The members statement: {e}."),
+                    )
+                })
+        };
+        match op {
+            "members" => {
+                let version = cached
+                    .as_ref()
+                    .and_then(|c| c["version"].as_str())
+                    .map(str::to_string);
+                let client = crate::InstanceClient::new(
+                    self.issuer()?,
+                    product.clone(),
+                    keys.clone(),
+                    self.transport.clone(),
+                    device.clone(),
+                );
+                match client.members(version.as_deref()).await {
+                    Ok(a) => {
+                        state.write_json(
+                            MEMBERS,
+                            &json!({"statement": a.statement, "version": a.members.version}),
+                        )?;
+                        let mut out = members_view(&a.members);
+                        out["unchanged"] = json!(a.unchanged);
+                        out["cached"] = json!(false);
+                        Ok(out)
+                    }
+                    // Offline: the last good statement, while it lasts.
+                    Err(e) if e.offline() => {
+                        let Some(statement) = cached.as_ref().and_then(|c| c["statement"].as_str())
+                        else {
+                            return Err(e);
+                        };
+                        let mut out = members_view(&verify(statement)?);
+                        out["cached"] = json!(true);
+                        Ok(out)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "members.verify" => {
+                let statement = match self.opt("statement") {
+                    Some(s) => s,
+                    None => cached
+                        .as_ref()
+                        .and_then(|c| c["statement"].as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            Error::new(None, "not_cached", "No members statement is kept here yet.")
+                        })?,
+                };
+                Ok(members_view(&verify(&statement)?))
             }
             _ => unreachable!(),
         }
@@ -2685,6 +2771,26 @@ fn parse_rfc3339(t: &str) -> Option<i64> {
 
 /// `s` as a file-name part: anything but letters, digits, `.`, `_` and `-`
 /// becomes `_`.
+/// Where `instance.members` keeps the last good members statement.
+const MEMBERS: &str = "members.json";
+
+/// A verified members statement as the helper reports it.
+fn members_view(s: &crate::MembersStatement) -> Value {
+    json!({
+        "enabled": s.enabled,
+        "reason": s.reason,
+        "account": {"id": s.account_id, "name": s.account_name},
+        "roles": s.roles,
+        "default_role": s.default_role,
+        "admin_role": s.admin_role,
+        "members": s.members,
+        "version": s.version,
+        "issued_at": s.iat,
+        "expires_at": s.exp,
+        "expired": s.expired(unix_now()),
+    })
+}
+
 /// Where `device.register` keeps the registration and the session that
 /// made it.
 const REGISTRATION: &str = "device-registration.json";

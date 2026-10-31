@@ -30,6 +30,17 @@ pub trait DeviceSigner: Send + Sync {
     }
 }
 
+/// 22 random URL-safe characters: the fresh value every signed form carries,
+/// since meros.co takes each signature once.
+pub(crate) fn nonce() -> String {
+    use rand::Rng;
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut rng = rand::rng();
+    (0..22)
+        .map(|_| ABC[rng.random_range(0..ABC.len())] as char)
+        .collect()
+}
+
 /// A form-encoded request signed with the device key, as meros.co's
 /// sign-in and device-registration endpoints take them: `fields`, then
 /// `device_id`, `device_pubkey` and `ts`, then `sig` last, over

@@ -230,6 +230,13 @@ pub struct FakeState {
     /// Whether signed-in tokens carry `devices:write`; without it device
     /// registration answers `403 insufficient_scope`.
     pub devices_scope: bool,
+    /// Cloud-managed users, as `POST /v1/instance/members` reports them for
+    /// a known instance: whether they're on, why not, the product's roles
+    /// and the team's members. The version follows their content.
+    pub members_enabled: bool,
+    pub members_reason: Option<String>,
+    pub member_roles: Vec<Value>,
+    pub instance_members: Vec<Value>,
     /// Claims laid over every id_token, to test a client's checks (a
     /// foreign `aud`, a wrong `nonce`, an old `exp`).
     pub id_token_overrides: Map<String, Value>,
@@ -309,6 +316,15 @@ impl Default for FakeState {
             challenges: HashMap::new(),
             used_signatures: HashSet::new(),
             id_token_overrides: Map::new(),
+            members_enabled: true,
+            members_reason: None,
+            member_roles: vec![
+                json!({"id": "admin", "name": "Administrator"}),
+                json!({"id": "operator", "name": "Operator"}),
+            ],
+            instance_members: vec![
+                json!({"sub": "u1", "name": "Pat", "email": "pat@example.com", "team_role": "owner", "role": "admin"}),
+            ],
             registered_devices: HashMap::new(),
             devices_scope: true,
             codes: HashMap::new(),
@@ -748,6 +764,7 @@ impl FakeMeros {
             }
             ["oauth", "par"] if st.par && r.method == "POST" => par(&mut st, &r),
             ["oauth", "token"] => oauth_token(&mut st, &r, &issuer),
+            ["v1", "instance", "members"] if r.method == "POST" => instance_members(&mut st, &r),
             ["v1", "device", op @ ("register" | "unregister")] if r.method == "POST" => {
                 device_registration(&mut st, &r, op)
             }
@@ -1027,6 +1044,96 @@ fn device_registration(st: &mut FakeState, r: &HttpRequest, op: &str) -> HttpRes
         json!({"product": product, "device_id": id, "account_id": account,
                "account_name": name, "registered_at": st.time()}),
     )
+}
+
+/// `POST /v1/instance/members`, as meros.co: a form signed with the device
+/// key from a known instance (an activated seat or a registered device),
+/// answered with the members and a statement signed with the Server key that
+/// lasts seven days; `{"unchanged": true}` and a fresh statement when the
+/// asked `version` is current.
+fn instance_members(st: &mut FakeState, r: &HttpRequest) -> HttpResponse {
+    use ed25519_dalek::Signer;
+    let known = match signed_body(st, r, "/v1/instance/members") {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let f: HashMap<String, String> = r.form_fields().into_iter().collect();
+    if f.get("nonce").is_none_or(|n| n.len() < 16) {
+        return oauth_err(400, "invalid_request", "A random nonce is required.");
+    }
+    if !known {
+        return oauth_err(
+            404,
+            "unknown_device",
+            "This device is not activated or registered.",
+        );
+    }
+    let id = f.get("device_id").cloned().unwrap_or_default();
+    let product = f
+        .get("product")
+        .cloned()
+        .unwrap_or_else(|| st.request_product.clone());
+    let account = st.team.clone().unwrap_or_else(|| PERSONAL.to_string());
+    let (account_name, _) = account_label(st, &account);
+    // Real time, like id_tokens, so clients judge expiry on their own clocks.
+    let now = unix_now();
+    let content = json!([
+        st.members_enabled,
+        st.members_reason,
+        st.member_roles,
+        st.instance_members
+    ]);
+    let version = format!(
+        "v-{}",
+        &Sha256::digest(content.to_string().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()[..12]
+    );
+    let payload = json!({
+        "v": 1, "typ": "instance_members", "kid": SERVER_KID, "product": product,
+        "device_id": id, "device_pubkey": f.get("device_pubkey").cloned().unwrap_or_default(),
+        "account_id": account, "account_name": account_name,
+        "enabled": st.members_enabled, "reason": st.members_reason, "version": version,
+        "roles": st.member_roles, "default_role": "operator", "admin_role": "admin",
+        "members": st.instance_members, "iat": now, "exp": now + 7 * 86_400,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let sig = ed25519_dalek::SigningKey::from_bytes(&SERVER_SEED).sign(&bytes);
+    let statement = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(&bytes),
+        URL_SAFE_NO_PAD.encode(sig.to_bytes())
+    );
+    if f.get("version") == Some(&version) {
+        return reply(
+            200,
+            json!({"unchanged": true, "version": version, "statement": statement}),
+        );
+    }
+    let mut body = payload.clone();
+    if let Some(m) = body.as_object_mut() {
+        for k in [
+            "v",
+            "typ",
+            "kid",
+            "product",
+            "device_id",
+            "device_pubkey",
+            "iat",
+            "exp",
+            "account_id",
+            "account_name",
+        ] {
+            m.remove(k);
+        }
+        m.insert(
+            "account".into(),
+            json!({"id": account, "name": account_name}),
+        );
+        m.insert("statement".into(), json!(statement));
+    }
+    reply(200, body)
 }
 
 /// Whether a redirect host is on the local network: private IPv4, IPv6

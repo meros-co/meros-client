@@ -684,16 +684,7 @@ impl MerosCloud {
         device: &dyn DeviceSigner,
         extra: &[(&str, &str)],
     ) -> Result<HttpResponse, Error> {
-        // A fresh nonce in every signed body: meros.co takes each signature
-        // once, and two calls can share a second.
-        let nonce: String = {
-            use rand::Rng;
-            const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-            let mut rng = rand::rng();
-            (0..22)
-                .map(|_| ABC[rng.random_range(0..ABC.len())] as char)
-                .collect()
-        };
+        let nonce = crate::device::nonce();
         let mut fields = vec![("product", product), ("nonce", nonce.as_str())];
         fields.extend_from_slice(extra);
         let token = self.token.access_token(false).await?;
