@@ -1,6 +1,6 @@
 [package]
 name = "meros-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "The Meros client services in one place: device licensing, Sign in with Meros, Meros Cloud, support tickets and the event emitter, plus an in-memory fake of the services for tests"
 license = "MIT"
