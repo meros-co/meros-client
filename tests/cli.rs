@@ -2031,3 +2031,22 @@ fn fake_mode_calls_at_once_keep_each_others_changes() {
         assert_eq!(out["status"], "signed_in", "{out}");
     }
 }
+
+#[tokio::test]
+async fn a_failed_delivery_says_why() {
+    let env = Env::new();
+    // A collector that won't take unsigned events.
+    let out = env
+        .ok(
+            "events.send",
+            json!({"events": [{"type": "example-app.thing.happened"}],
+                   "collectors": [{"url": ISSUER, "auth": "none"}]}),
+        )
+        .await;
+    assert_eq!(
+        (out["failed"].as_u64(), out["pending"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(out["delivery_error"]["code"], "invalid_token");
+    assert_eq!(out["delivery_error"]["status"], 401);
+}

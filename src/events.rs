@@ -193,6 +193,9 @@ pub struct FlushReport {
     pub rejected: u64,
     /// Collectors that didn't take the batch; it stays queued.
     pub failed: usize,
+    /// Why the last collector that failed didn't take it: offline
+    /// (`network`) or its refusal, such as `insufficient_scope`.
+    pub error: Option<Error>,
 }
 
 struct Inner {
@@ -415,8 +418,9 @@ impl Emitter {
                         all_took = false;
                         break;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         report.failed += 1;
+                        report.error = Some(e);
                         all_took = false;
                     }
                 }

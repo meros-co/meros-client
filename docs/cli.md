@@ -691,7 +691,9 @@ Input: `events`, an array of:
   session).
 
 Returns `{instance, pending, delivered, accepted, duplicates, rejected,
-failed}`. What isn't delivered stays in `events/outbox.json` and goes with
+failed}`, plus `delivery_error: {code, message, status}` when a collector
+didn't take the batch: `network` offline, else its refusal (such as
+`insufficient_scope`). What isn't delivered stays in `events/outbox.json` and goes with
 the next `events.send` or `events.flush`, under the same ids. A collector
 that already took one counts it as a duplicate.
 

@@ -2610,6 +2610,10 @@ impl Ctx {
             out["duplicates"] = json!(r.duplicates);
             out["rejected"] = json!(r.rejected);
             out["failed"] = json!(r.failed);
+            if let Some(e) = &r.error {
+                out["delivery_error"] =
+                    json!({"code": e.code, "message": e.message, "status": e.status});
+            }
         }
         Ok(out)
     }
