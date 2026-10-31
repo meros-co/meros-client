@@ -2065,6 +2065,7 @@ async fn instance_members_are_kept_and_verified_offline() {
     let (code, err) = env.refused("instance.members.verify", json!({})).await;
     assert_eq!((code, err.as_str()), (exit::LOCAL, "not_cached"));
 
+    env.fake.state().team = Some("acct-team".into());
     let m = env.ok("instance.members", json!({})).await;
     assert_eq!(
         (m["enabled"].clone(), m["cached"].clone()),
@@ -2072,6 +2073,14 @@ async fn instance_members_are_kept_and_verified_offline() {
     );
     assert_eq!(m["members"][0]["sub"], "u1");
     assert_eq!(m["members"][0]["role"], "admin");
+    assert_eq!(
+        (m["account_id"].clone(), m["account_name"].clone()),
+        (json!("acct-team"), json!("Crew"))
+    );
+    assert_eq!(
+        m["roles"][1],
+        json!({"name": "operator", "label": "Operator"})
+    );
     assert_eq!(
         m["expires_at"].as_i64().unwrap() - m["issued_at"].as_i64().unwrap(),
         7 * 86_400

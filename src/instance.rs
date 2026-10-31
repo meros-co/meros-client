@@ -16,12 +16,13 @@ use crate::Error;
 use crate::device::DeviceSigner;
 use crate::http::{Transport, unix_now};
 
-/// A role a product declares on meros.co.
+/// A role a product declares on meros.co: its `name` (what a member's
+/// `role` holds) and a `label` to show.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRole {
-    pub id: String,
-    #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub label: String,
 }
 
 /// A member of the owning team, and their role here.
@@ -35,7 +36,8 @@ pub struct Member {
     /// Their role in the team: `owner`, `admin`, `billing` or `member`.
     #[serde(default)]
     pub team_role: String,
-    /// Their role in this product; `None` is no access.
+    /// Their role in this product (a [`MemberRole::name`]); `None` is no
+    /// access.
     pub role: Option<String>,
 }
 
@@ -46,27 +48,20 @@ pub struct MembersStatement {
     pub typ: String,
     pub kid: String,
     pub product: String,
-    pub device_id: String,
-    pub device_pubkey: String,
+    /// The account holding the instance's license.
     pub account_id: String,
     #[serde(default)]
     pub account_name: String,
-    /// Whether cloud-managed users may be used here now.
+    /// Whether cloud-managed users may be used here now: false for a
+    /// personally owned instance or when the team's add-on has lapsed, and
+    /// then `members` is empty.
     pub enabled: bool,
-    /// Why not, when `enabled` is false: `personal_account`,
-    /// `no_team_addon`, `gate_lapsed`.
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// Opaque; sent back to ask whether anything changed.
-    pub version: String,
     #[serde(default)]
     pub roles: Vec<MemberRole>,
     #[serde(default)]
-    pub default_role: Option<String>,
-    #[serde(default)]
-    pub admin_role: Option<String>,
-    #[serde(default)]
     pub members: Vec<Member>,
+    /// Opaque; sent back to ask whether anything changed.
+    pub version: String,
     pub iat: i64,
     pub exp: i64,
 }
@@ -86,15 +81,13 @@ impl MembersStatement {
 }
 
 /// Verifies a members statement: the product key's Ed25519 signature over
-/// the exact payload bytes, the type, and that it was issued to this product
-/// and device. Whether it has expired is the caller's to decide (see
+/// the exact payload bytes, the type, and that it is for this product.
+/// Whether it has expired is the caller's to decide (see
 /// [`MembersStatement::expired`]).
 pub fn verify_members(
     keys: &[(&str, &str)],
     statement: &str,
     product: &str,
-    device_id: &str,
-    device_pubkey: &str,
 ) -> Result<MembersStatement, String> {
     let (payload_b64, sig_b64) = statement
         .trim()
@@ -126,8 +119,8 @@ pub fn verify_members(
     if s.v != 1 || s.typ != "instance_members" {
         return Err("not a members statement".into());
     }
-    if s.product != product || s.device_id != device_id || s.device_pubkey != device_pubkey {
-        return Err("statement is for another product or device".into());
+    if s.product != product {
+        return Err("statement is for another product".into());
     }
     Ok(s)
 }
@@ -172,9 +165,10 @@ impl InstanceClient {
     /// `POST /v1/instance/members`, device-signed. With `version` (the last
     /// one seen), an unchanged list comes back as a fresh statement for the
     /// same version. The statement is verified before it is returned; one
-    /// that doesn't verify is `verify_failed`. Refusals include
-    /// `unknown_device` (not activated or registered for the product),
-    /// `bad_signature` and `rate_limited`.
+    /// that doesn't verify is `verify_failed`. Refusals: `unknown_device`
+    /// (403: not activated or registered for the product), `bad_signature`,
+    /// `invalid_request` (also an unknown product), `rate_limited`, and
+    /// `not_configured` (503: the product has no signing key there yet).
     pub async fn members(&self, version: Option<&str>) -> Result<MembersAnswer, Error> {
         let nonce = crate::device::nonce();
         let mut fields = vec![("product", self.product.as_str()), ("nonce", &nonce)];
@@ -202,20 +196,18 @@ impl InstanceClient {
                 )
             })?
             .to_string();
-        let id = self.device.identity().ok_or_else(Error::no_identity)?;
         let keys: Vec<(&str, &str)> = self
             .keys
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let members = verify_members(&keys, &statement, &self.product, &id.id, &id.pubkey)
-            .map_err(|e| {
-                Error::new(
-                    None,
-                    "verify_failed",
-                    format!("The members statement: {e}."),
-                )
-            })?;
+        let members = verify_members(&keys, &statement, &self.product).map_err(|e| {
+            Error::new(
+                None,
+                "verify_failed",
+                format!("The members statement: {e}."),
+            )
+        })?;
         Ok(MembersAnswer {
             statement,
             members,
