@@ -1,0 +1,141 @@
+# Builds the meros-client command-line helper for each platform when a
+# version tag (`v0.1.0`) is pushed, and attaches the binaries to a GitHub
+# release with a signed SHA256SUMS. See docs/cli.md, "Prebuilt binaries".
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Small, self-contained binaries: release builds only, set here so the
+  # crate's own profiles stay as they are for library users.
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+  CARGO_PROFILE_RELEASE_LTO: "true"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the crate version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests
+        run: cargo test --locked --features cli,fake,loopback
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            exe: .exe
+          - name: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            musl: true
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            musl: true
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --locked --features cli --bin meros-client --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/meros-client${{ matrix.exe }} dist/meros-client-${{ matrix.name }}${{ matrix.exe }}
+      - name: Smoke test
+        shell: bash
+        run: dist/meros-client-${{ matrix.name }}${{ matrix.exe }} --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-macos:
+    needs: check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build both architectures and join them
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --features cli --bin meros-client --target $t
+          done
+          mkdir -p dist
+          lipo -create -output dist/meros-client-macos-universal \
+            target/aarch64-apple-darwin/release/meros-client \
+            target/x86_64-apple-darwin/release/meros-client
+          lipo -info dist/meros-client-macos-universal
+      - name: Smoke test
+        run: dist/meros-client-macos-universal --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [build, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release
+      id-token: write # keyless signing and attestations
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum meros-client-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the checksums (keyless, this workflow's identity)
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      - name: Build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/meros-client-*
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "meros-client $GITHUB_REF_NAME" \
+            --notes "Command-line helper binaries. Verify with SHA256SUMS and its Sigstore bundle; see docs/cli.md."

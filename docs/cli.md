@@ -24,6 +24,38 @@ echo '{"state_dir": "/var/lib/example/meros"}' | meros-client device.identity
 `meros-client commands` lists the commands, and `meros-client --version`
 prints the version.
 
+## Prebuilt binaries
+
+Each `vX.Y.Z` tag publishes a GitHub release of this repository with:
+
+| File | Platform |
+|---|---|
+| `meros-client-windows-x64.exe` | Windows x64 |
+| `meros-client-windows-arm64.exe` | Windows ARM64 |
+| `meros-client-macos-universal` | macOS, Apple silicon and Intel |
+| `meros-client-linux-x64` | Linux x64, static (musl): any distribution |
+| `meros-client-linux-arm64` | Linux ARM64, static (musl) |
+| `SHA256SUMS` | Checksums of the five |
+| `SHA256SUMS.sigstore.json` | The checksums' Sigstore signature |
+
+Pin a release, download the binary for the platform with `SHA256SUMS` and
+its bundle, and check both before use. On macOS and Linux, mark the binary
+executable after downloading.
+
+```sh
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json   --certificate-oidc-issuer https://token.actions.githubusercontent.com   --certificate-identity-regexp '^https://github.com/meros-co/meros-client/\.github/workflows/release\.yml@refs/tags/v'
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+The signature is keyless: it proves the checksums came from this
+repository's release workflow at a version tag, with no key to keep.
+Each binary also carries a build-provenance attestation
+(`gh attestation verify <file> --repo meros-co/meros-client`).
+
+The binaries aren't code-signed for Windows SmartScreen or macOS
+Gatekeeper. Products that ship the helper inside a signed app sign it with
+the app.
+
 ## Output and exit codes
 
 Success prints `{"ok": true, ...}` with the command's fields. Failure prints:
